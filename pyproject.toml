@@ -63,6 +63,7 @@ where = ["src"]
 "tilefoundry.codegen.cpu.templates" = ["*.j2"]
 "tilefoundry.target.cuda.hardware" = ["*.toml"]
 "tilefoundry.target.amx.hardware" = ["*.toml"]
+"tilefoundry.target.ascend.hardware" = ["*.toml"]
 
 [tool.setuptools.data-files]
 "share/tilefoundry/spec" = ["docs/spec/*.md"]

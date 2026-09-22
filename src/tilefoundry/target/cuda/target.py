@@ -41,6 +41,7 @@ class CudaTarget(Target):
     """CUDA target composed from one device and the architecture it runs."""
 
     name: ClassVar[str] = "cuda"
+    gmem_device_type: ClassVar[str] = "kDLCUDA"
     hardware: ClassVar[HardwareSpec] = HardwareSpec(
         package="tilefoundry.target.cuda.hardware",
         schemas={

@@ -1,0 +1,50 @@
+[spec]
+schema = "tilefoundry.ascend.architecture/v1"
+kind = "architecture"
+id = "huawei.dav2201"
+
+[facts.identity.name]
+value = "dav-2201"
+unit = "name"
+origin = "vendor"
+source = "CANN 8.5 bisheng --npu-arch accepted values"
+conditions = "the AscendC compilation architecture identity bisheng compiles this target's device units for (Ascend 910B family)"
+
+[facts.instruction.capabilities]
+value = ["vector", "cube"]
+unit = "name"
+origin = "vendor"
+source = "CANN AscendC Programming Guide"
+conditions = "instruction families the dav-2201 code path may select"
+
+[facts.instruction.compute_dtypes]
+value = ["f32", "f16", "bf16"]
+unit = "name"
+origin = "vendor"
+source = "CANN AscendC API Reference, vector instructions"
+conditions = "dtypes with a dav-2201 vector compute instruction"
+
+[facts.compute.max_vector_lanes]
+value = 1024
+unit = "count"
+origin = "derived"
+source = "tilefoundry"
+conditions = "structural ceiling for a mesh's thread-level (vector-lane) extent; there is no SIMT width on an AI Core, so this is a program-logical bound rather than a hardware width"
+
+[facts.memory.unified_buffer.per_core]
+value = 262144
+unit = "byte"
+origin = "vendor"
+source = "CANN AscendC Programming Guide, Unified Buffer"
+conditions = "256 KiB of Unified Buffer addressable per AI Core on the Ascend 910B family"
+
+[facts.memory.unified_buffer.owner]
+value = "cta"
+unit = "name"
+origin = "vendor"
+source = "CANN AscendC Programming Guide"
+conditions = "the Unified Buffer is allocated per AI Core block, the Ascend execution unit TileFoundry names cta"
+
+[facts.memory.unified_buffer.bandwidth]
+status = "unavailable"
+conditions = "Huawei publishes no static Unified Buffer bandwidth to use for a roofline."

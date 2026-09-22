@@ -813,3 +813,68 @@ class TopologyFacts:
     state. It only converts what the specification already records.
   - There MUST be no public Facts registration step or global Target Facts
     table. A custom Target provider registers only its Target class.
+
+## 12. `AscendTarget`
+
+```python
+class AscendTarget(Target):
+    """Compose one Ascend target from one architecture and one device."""
+
+    name: ClassVar[str] = "ascend"
+    gmem_device_type: ClassVar[str] = "kDLExtDev"
+    architecture: Architecture
+    device: Device
+    device_count: int | None
+    architecture_id: str | None
+    device_id: str | None
+    arch: str
+
+    def __init__(
+        self,
+        device: Device | str | Path | None = None,
+        architecture: Architecture | str | Path | None = None,
+        *,
+        device_count: int | None = None,
+    ) -> None: ...
+
+    def topology_limit(self, name: str) -> int: ...
+
+    def get_facts(self, facts_type: type[FactsT], query=None) -> FactsT: ...
+```
+
+- constraints:
+  - `device` and `architecture` MUST accept an installed document ID, a
+    document path, or a concrete value, on the same terms as
+    [§4](#4-cudatarget). An omitted architecture MUST be read from the device
+    document's sole compatibility declaration; an omitted device MUST select
+    the installed `huawei.ascend910b2c` document, whose sole compatible
+    architecture is `huawei.dav2201`.
+  - `arch` MUST equal `architecture.name`, which MUST be the value bisheng's
+    `--npu-arch` takes (`dav-2201` for the 910B family).
+  - `gmem_device_type` MUST be `"kDLExtDev"`: torch_npu hands NPU tensors out
+    as DLPack extension devices, so that is the placement a host entry checks
+    for. `CudaTarget` states `"kDLCUDA"` for the same reason; a Target that
+    states no GMEM device type (the CPU) MUST refuse GMEM placement checks
+    rather than guess.
+  - `AscendTarget.available()` MUST contain one value per device document whose
+    sole compatible architecture document is available. Its `identity` MUST be
+    that device document's ID.
+  - `get_facts(TopologyFacts).topologies` MUST name `("npu", "cta", "thread")`,
+    mapping CUDA's program levels onto Ascend execution: `npu` which card (told
+    at launch, no card can read which of them it is), `cta` one AI Core block
+    (`GetBlockIdx()`'s unit, what a launch's `grid_x` counts), `thread` the
+    vector-lane level of one core (no SIMT register exists for it).
+  - Only `npu` MUST set `from_target`: how many cards a deployment names is
+    stated by whoever constructs the target, through `device_count`, which MUST
+    be a positive int or omitted. `cta` MUST state no static ceiling (the
+    launch's `grid_x` decides it), and `thread` MUST carry the architecture's
+    vector-lane limit.
+  - `topology_limit("npu")` MUST return the stated `device_count` (defaulting
+    to one card), `topology_limit("cta")` MUST return the device's AI Core
+    count, and `topology_limit("thread")` MUST return the architecture's
+    vector-lane limit. Unsupported levels MUST raise an actionable error naming
+    the supported levels.
+  - The Ascend link MUST compile the host unit and every AscendC device unit in
+    one bisheng invocation (`-xasc`), because host and device code share the
+    one dialect bisheng speaks; the split nvcc/g++ pipeline MUST NOT be used,
+    and a library MUST NOT link CUDA and Ascend device units together.

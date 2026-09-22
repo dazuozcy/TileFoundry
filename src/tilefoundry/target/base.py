@@ -201,6 +201,14 @@ class Target:
 
     name: ClassVar[str]
 
+    gmem_device_type: ClassVar[str] = ""
+    """The DLPack ``device_type`` constant a GMEM tensor of this target carries.
+
+    A host entry checks each runtime tensor against this before forwarding it
+    to a device launch shim. Empty means the target states no device memory
+    (a CPU target), so GMEM placement cannot be checked for it.
+    """
+
     @property
     def identity(self) -> str:
         """The stable identity of this concrete Target value."""
