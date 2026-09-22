@@ -17,7 +17,7 @@ from tilefoundry.ir.tir.launch import launch_call
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Sequential
 from tilefoundry.passes.pass_base import ModulePass
-from tilefoundry.target import CpuTarget, CudaTarget
+from tilefoundry.target import CpuTarget
 
 _DEFAULT_ENTRY_NAME = "main"
 
@@ -48,11 +48,11 @@ def _device_callee(module: Module) -> PrimFunction:
     device_fns = [
         fn
         for fn in module.functions
-        if isinstance(fn, PrimFunction) and isinstance(fn.target, CudaTarget)
+        if isinstance(fn, PrimFunction) and not isinstance(fn.target, CpuTarget)
     ]
     if len(device_fns) != 1:
         raise ValueError(
-            f"insert_default_host_entry: expected exactly one CUDA device "
+            f"insert_default_host_entry: expected exactly one device "
             f"prim_function and no CPU entry, found {len(device_fns)} device "
             f"functions"
         )

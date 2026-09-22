@@ -1,0 +1,88 @@
+[spec]
+schema = "tilefoundry.ascend.device/v1"
+kind = "device"
+id = "huawei.ascend910b2c"
+
+[compatibility]
+architectures = ["huawei.dav2201"]
+
+[facts.identity.name]
+value = "ascend910b2c"
+unit = "name"
+origin = "vendor"
+source = "npu-smi info (910B2C), torch.npu.get_device_properties"
+conditions = "product identity reported by the driver"
+
+[facts.compute.ai_core_count]
+value = 48
+unit = "count"
+origin = "vendor"
+source = "torch.npu.get_device_properties(0).multi_processor_count on a 910B2C"
+conditions = "how many AI Core blocks one launch may occupy; the launch's grid_x may not exceed this"
+
+[facts.compute.vector_core_count]
+value = 48
+unit = "count"
+origin = "vendor"
+source = "torch.npu.get_device_properties(0).vector_core_num on a 910B2C"
+conditions = "vector units, one per AI Core"
+
+[facts.compute.cube_core_count]
+value = 24
+unit = "count"
+origin = "vendor"
+source = "torch.npu.get_device_properties(0).cube_core_num on a 910B2C"
+conditions = "cube (matrix) units, shared two AI Cores per unit"
+
+[facts.memory.hbm.capacity]
+value = 65452113920
+unit = "byte"
+origin = "vendor"
+source = "torch.npu.get_device_properties(0).total_memory on a 910B2C"
+conditions = "device-visible HBM capacity"
+
+[facts.memory.hbm.owner]
+value = "target"
+unit = "name"
+origin = "derived"
+source = "tilefoundry"
+conditions = "the stated HBM capacity is one pool shared by all execution units of this single-device target"
+
+[facts.memory.hbm.bandwidth]
+value = 1600000000000
+unit = "byte/s"
+origin = "reference"
+source = "Huawei Atlas 900I A2 / Ascend 910B product documentation"
+conditions = "1.6 TB/s theoretical HBM2e bandwidth for the 910B family, decimal"
+
+[facts.memory.l2.capacity]
+value = 201326592
+unit = "byte"
+origin = "vendor"
+source = "torch.npu.get_device_properties(0).L2_cache_size on a 910B2C"
+conditions = "192 MiB L2"
+
+[facts.memory.l2.bandwidth]
+status = "unavailable"
+conditions = "Huawei publishes no static L2 bandwidth to use for a roofline."
+
+[facts.throughput.f32]
+value = 100000000000000
+unit = "flop/s"
+origin = "reference"
+source = "Huawei Ascend 910B product documentation"
+conditions = "approximate dense FP32 vector peak for the 48 vector cores; an envelope for analysis, not a measured calibration"
+
+[facts.throughput.f16]
+value = 200000000000000
+unit = "flop/s"
+origin = "reference"
+source = "Huawei Ascend 910B product documentation"
+conditions = "approximate dense FP16 vector peak; an envelope for analysis, not a measured calibration"
+
+[facts.throughput.bf16]
+value = 200000000000000
+unit = "flop/s"
+origin = "reference"
+source = "Huawei Ascend 910B product documentation"
+conditions = "approximate dense BF16 vector peak; an envelope for analysis, not a measured calibration"

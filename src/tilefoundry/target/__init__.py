@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from tilefoundry.target.amx import AmxTarget, AppleAmx, AppleM2Pro
+from tilefoundry.target.ascend import (
+    AscendArchitecture,
+    AscendDevice,
+    AscendTarget,
+)
 from tilefoundry.target.base import (
     Architecture,
     Device,
@@ -69,6 +74,9 @@ __all__ = [
     "AppleAmx",
     "AppleM2Pro",
     "Architecture",
+    "AscendArchitecture",
+    "AscendDevice",
+    "AscendTarget",
     "CpuTarget",
     "CudaArchitecture",
     "CudaDevice",
