@@ -7,5 +7,6 @@ to any of them.
 
 from __future__ import annotations
 
+from tilefoundry.codegen import ascend as _ascend  # noqa: F401 -- registers the Ascend side
 from tilefoundry.codegen import cpu as _cpu  # noqa: F401 -- registers the host side
 from tilefoundry.codegen import cuda as _cuda  # noqa: F401 -- registers the device side

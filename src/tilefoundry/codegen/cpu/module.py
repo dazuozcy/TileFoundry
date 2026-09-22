@@ -40,10 +40,8 @@ from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.ir.visitor import ExprVisitor
 from tilefoundry.target import Target
 
-_STORAGE_DEVICE_TYPE = {
-    StorageKind.GMEM: "kDLCUDA",
-    StorageKind.HOST: "kDLCPU",
-}
+_HOST_DEVICE_TYPE = "kDLCPU"
+"""What a host-ABI tensor parameter carries, for the placement check."""
 
 _DIM_BINOP_CXX = {
     DimAdd: "+",
@@ -124,13 +122,19 @@ def _reject_unsupported_config(cfg: Launch) -> None:
         raise NotImplementedError("emit_host_module: launch `attrs` are not supported yet")
 
 
-def _placement_line(name: str, storage) -> str:
-    """Refuse a tensor that is not where the parameter's storage says it is."""
-    device_type = _STORAGE_DEVICE_TYPE.get(storage)
-    if device_type is None:
+def _placement_line(name: str, storage, device_type: str) -> str:
+    """Refuse a tensor that is not where the callee's target keeps device memory."""
+    if storage is StorageKind.HOST:
+        device_type = _HOST_DEVICE_TYPE
+    elif storage is not StorageKind.GMEM:
         raise ValueError(
             f"emit_host_module: parameter {name!r} storage {storage!r} cannot "
             f"be a host ABI tensor argument (kernel-internal storage or unset)"
+        )
+    elif not device_type:
+        raise ValueError(
+            f"emit_host_module: parameter {name!r} is GMEM but the callee's "
+            f"target states no GMEM device type to check placement against"
         )
     return (
         f"if ({name}.device().device_type != {device_type}) "
@@ -208,7 +212,7 @@ def _one_launch(
     shim = ctx.signature_of(callee)
     bound = _as_this_scope_names_it(shim, forwarded, launch)
     lines = [
-        _placement_line(var.name, param.type.storage)
+        _placement_line(var.name, param.type.storage, callee.target.gmem_device_type)
         for var, param in zip(forwarded, callee.params)
     ]
     lines.append(f"{shim.name}({ctx.arguments(bound, callee.target)});")

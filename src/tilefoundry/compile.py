@@ -10,6 +10,7 @@ import os
 import tempfile
 from dataclasses import dataclass, replace
 
+from tilefoundry.codegen.ascend.context import AscendCodegenContext
 from tilefoundry.codegen.context_builder import build_codegen_context
 from tilefoundry.codegen.cpu.context import CpuCodegenContext
 from tilefoundry.codegen.cuda.context import CudaCodegenContext
@@ -20,7 +21,7 @@ from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.passes.pass_manager import PassManager
 from tilefoundry.passes.transforms import InsertHostEntryPass
 from tilefoundry.runtime.loader import load_linked_module
-from tilefoundry.target import CpuTarget, CudaTarget, Target, default_target
+from tilefoundry.target import AscendTarget, CpuTarget, CudaTarget, Target, default_target
 from tilefoundry.target.base import _target_summary, target_instance
 
 
@@ -139,6 +140,17 @@ def _build_split_runtime_module(mod: Module, *, workdir: str) -> "RuntimeModule"
                     group.owner, group.functions, group.target, context
                 )
             )
+        elif isinstance(group.target, AscendTarget):
+            context = AscendCodegenContext(
+                symbols=view.symbols,
+                target=view.target,
+                codegen_context=view.codegen,
+            )
+            device_modules.append(
+                group.target.get_code_generator().emit(
+                    group.owner, group.functions, group.target, context
+                )
+            )
         elif isinstance(group.target, CpuTarget):
             if cpu_entry not in group.functions:
                 continue
@@ -159,16 +171,23 @@ def _build_split_runtime_module(mod: Module, *, workdir: str) -> "RuntimeModule"
     entry_signature = codegen.symbols.by_function[id(cpu_entry)].callable
     loaded_as = replace(entry_signature, name=cpu_entry.name)
     device_targets = tuple(
-        group.target for group in codegen.groups if isinstance(group.target, CudaTarget)
+        group.target
+        for group in codegen.groups
+        if not isinstance(group.target, CpuTarget)
     )
     if not device_targets:
-        raise ValueError(f"tilefoundry.build: module {mod.name!r} has no CUDA device functions")
+        raise ValueError(f"tilefoundry.build: module {mod.name!r} has no device functions")
+    link_kwargs = {}
+    if isinstance(device_targets[0], CudaTarget):
+        link_kwargs["cuda_arch"] = device_targets[0].arch.removeprefix("sm_")
+    elif isinstance(device_targets[0], AscendTarget):
+        link_kwargs["npu_arch"] = device_targets[0].arch
     linked_module = link_modules(
         units,
         workdir=os.path.join(workdir, digest),
         lib_name=cpu_entry.name,
         entry=loaded_as,
-        cuda_arch=device_targets[0].arch.removeprefix("sm_"),
+        **link_kwargs,
     )
     return load_linked_module(linked_module)
 
