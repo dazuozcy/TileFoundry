@@ -9,6 +9,7 @@ from dataclasses import fields, is_dataclass
 from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
 
+from tilefoundry.analysis.footprint import wave_of
 from tilefoundry.analysis.metadata import (
     Breakdown,
     ComputeCostMetadata,
@@ -228,12 +229,17 @@ def report_data(
     selected_types_ = selected_types(module, analyses, metadata_types)
     selected = frozenset(selected_types_)
     target = module.resolve_target()
+    wave = wave_of(module, target, topology_level)
     function_records = _records_of(function, selected)
     data = {
         "target": target.identity,
         "module": module.name,
         "function": function.name,
         "topology": topology_level,
+        "wave": {
+            "counted": 0 if wave is None else wave[0],
+            "declared": 0 if wave is None else wave[1],
+        },
         "requested": list(analyses),
         "executed": list(executed),
         "function_records": function_records,

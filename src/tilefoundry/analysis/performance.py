@@ -10,12 +10,15 @@ from tilefoundry.ir.core import attach_metadata as attach
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary
+from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.types.shape_helpers import static_dim_value
 from tilefoundry.ir.visitor import ExprVisitor
+from tilefoundry.target import UnsupportedCapabilityError
+from tilefoundry.target.facts import TopologyFacts
 
 from .compute_cost import local_duration_ns
 from .errors import AnalysisError
-from .facts import ParallelCapacityFacts, PerformanceServiceFacts, ThroughputFacts
+from .facts import PerformanceServiceFacts, ThroughputFacts
 from .iteration_scope import IterationScope
 from .metadata import (
     ComputeCostMetadata,
@@ -41,6 +44,12 @@ class PerformanceContext(AnalyzeContext):
 
 class PerformanceVisitor(ExprVisitor[None]):
     """Collect one duration per Call in authored order."""
+
+    def visit_MeshRegion(self, expr: MeshRegion, ctx: PerformanceContext) -> None:
+        child = next(item for item in ctx.current.children if item.owner is expr)
+        for arg in expr.args:
+            self.visit(arg, ctx)
+        self.visit(expr.body, replace(ctx, current=child))
 
     def visit_LoopRegion(self, expr: LoopRegion, ctx: PerformanceContext) -> None:
         child = next(item for item in ctx.current.children if item.owner is expr)
@@ -149,15 +158,19 @@ def analyze_performance(function: Function, context: AnalyzeContext) -> None:
     roofline = get_metadata(function, RooflineMetadata)
     if roofline is not None:
         summary_end = max(summary_end, roofline.ideal_ns)
-    placement = context.target.get_facts(ParallelCapacityFacts)
-    topology = context.module.resolve_topology(placement.topology)
+    level = context.target.get_facts(TopologyFacts).parallel()
+    if level is None or level.max_physical_units is None:
+        raise UnsupportedCapabilityError(
+            f"{type(context.target).__name__}: no default parallel topology level"
+        )
+    topology = context.module.resolve_topology(level.name)
     topology_extent = static_dim_value(topology.size)
     if topology_extent is None:
         raise AnalysisError(
             f"performance: topology {topology.name!r} has unresolved extent "
             f"{topology.size!r}"
         )
-    waves = -(-topology_extent // placement.parallel_units)
+    waves = -(-topology_extent // level.max_physical_units)
     attach(
         function,
         PerformanceSummaryMetadata(

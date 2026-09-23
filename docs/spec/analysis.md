@@ -41,15 +41,15 @@ Each owns its record types and declares its dependencies and output additions.
 | Selector | Requires | Owns | Attaches to | Rests on | Text summary adds | Annotates equations |
 |---|---|---|---|---|---|---|
 | `compute-cost` | - | `ComputeCostMetadata` | every measured Call and the Function | the authored program | `compute-cost` | every measured Call |
-| `memory` | - | `MemoryMetadata`, `RegionMemoryMetadata` | `MemoryMetadata` on every measured Call; `RegionMemoryMetadata` on the Function | the authored program, `MemoryHierarchyFacts` | `memory`, `advisory` | every measured Call |
+| `memory` | - | `MemoryMetadata`, `RegionMemoryMetadata` | `MemoryMetadata` on every measured Call; `RegionMemoryMetadata` on the Function | the authored program, `MemoryHierarchyFacts`, `TopologyFacts` | `memory`, `advisory` | every measured Call |
 | `roofline` | `compute-cost`, `memory` | `RooflineMetadata` | every measured Call and the Function | `ThroughputFacts` | `roofline` | every measured Call |
-| `performance` | `compute-cost`, `memory` | `PerformanceMetadata`, `PerformanceSummaryMetadata` | `PerformanceMetadata` on every Call with a modeled duration; `PerformanceSummaryMetadata` on the Function | `ThroughputFacts`, `ParallelCapacityFacts`, `MemoryHierarchyFacts` | `performance` | every Call with a modeled duration |
+| `performance` | `compute-cost`, `memory` | `PerformanceMetadata`, `PerformanceSummaryMetadata` | `PerformanceMetadata` on every Call with a modeled duration; `PerformanceSummaryMetadata` on the Function | `ThroughputFacts`, `TopologyFacts`, `MemoryHierarchyFacts` | `performance` | every Call with a modeled duration |
 
 Every compact text summary begins with these two lines:
 
 ```text
 # example
-# analysis target=<target> module=<module> function=<function> topology=<level>
+# analysis target=<target> module=<module> function=<function> topology=<level> wave=<counted>/<declared>
 # selection requested=<selector>[,<selector>...] executed=<selector>[,<selector>...]
 ```
 
@@ -60,7 +60,9 @@ are records of the report rather than of the IR; every other summary line is a
 record of the selected Function.
 
 The JSON report carries the same identity and selection in `target`, `module`,
-`function`, `topology`, `requested`, and `executed`. Whole-function
+`function`, `topology`, `wave`, `requested`, and `executed`. `wave` holds
+`counted` and `declared`.
+Whole-function
 projections are under `function_records`; `calls` is a value-ordered list whose
 entries have a `value` label and one key per selected family. `loops` is the
 corresponding authored-loop list, labelled by induction variable. Memory does not
@@ -121,7 +123,7 @@ layer settles is which type a field holds and what its keys name:
     establish every requested root's family-specific readiness. Each family
     states its own through the checker its descriptor carries, and one
     metadata-free traversal of the derived program answers all of them.
-    Performance readiness requires a positive `ParallelCapacityFacts` value for
+    Performance readiness requires positive `TopologyLevelFacts.max_physical_units` for
     the selected topology, rates stated for that same level, and one valid
     execution placement for every occurrence that will take time. Where the
     buffers go is not a readiness question: nothing here decides it.
@@ -215,56 +217,17 @@ Each reported Call's JSON projection is under its `compute-cost` key:
 
 #### 1.2.2 `memory`
 
-`memory` measures whole-Function value lifetimes and placement peaks, and states
-what every occurrence moves and at which level. The movement is read off the
-Op's own registered evaluator and the amounts its access relations reach. The
-records reserve an optional read-footprint conclusion, but this analysis does
-not currently produce one: both attachment points report `footprint=None`.
+`memory` states what every occurrence moves and at which level, the unique
+addresses one wave touches at a representative iteration, whole-Function value
+lifetimes and placement peaks, and which repeated reads fit in cache. The movement
+is read off the Op's own registered evaluator and the amounts its access
+relations reach.
+
+Every measured `Call` carries `MemoryMetadata`; every reachable `Function`
+carries `RegionMemoryMetadata`. A `LoopRegion` carries neither an empty record
+nor a footprint merely to reserve an attachment point.
 
 ```python
-class Spread[V]:
-    """One quantity, whole and as one unit of each topology level holds it.
-
-    A finer level's unit sits inside a coarser one, so its share is the coarser
-    share divided again by whatever the mesh splits between them. Every level
-    is stated because reading that chain otherwise takes one analysis per level
-    and a reader who knew to ask.
-
-    Attributes:
-        logical: attribute; What the authored operation asks for before replication.
-        total: attribute; What the whole execution asks for.
-        per_unit: attribute; What one unit of each level holds, in topology order.
-    """
-
-    logical: V
-    total: V
-    per_unit: tuple[V, ...] = ()
-
-
-class Breakdown[V]:
-    """One category's quantities, split by the kind of thing each one is.
-
-    Attributes:
-        kinds: attribute; One Spread per kind, in name order.
-    """
-
-    kinds: tuple[tuple[str, Spread[V]], ...] = ()
-
-
-class Traffic:
-    """Movement grouped by storage and communication boundary."""
-
-    storage: Breakdown[TrafficBytes] = Breakdown()
-    communication: Breakdown[TrafficBytes] = Breakdown()
-
-
-class Footprint:
-    """Unique read bytes, or the available lower bound when incomplete."""
-
-    buffers: tuple[tuple[str, Breakdown[int]], ...] = ()
-    complete: bool = True
-
-
 class MemoryMetadata(IRMetadata):
     """One primitive Call's memory behavior for one occurrence."""
 
@@ -274,57 +237,73 @@ class MemoryMetadata(IRMetadata):
     footprint: Footprint | None = None
 
 
-class MemoryLevelPeak:
-    """How much of one memory level a function needs at its peak.
+class ReuseWindow:
+    """One buffer's re-reads, and what keeping it costs the cache."""
 
-    Attributes:
-        memory_level: attribute; The memory level name.
-        peak_bytes: attribute; The solved address high-water mark for gmem/smem,
-            or the largest single logical value for rmem.
-        persistent_bytes: attribute; The part that cannot be reclaimed.
-        capacity_bytes: attribute; The stated capacity, or None when unknown.
-    """
+    buffer: str
+    time: str = ""
+    space: str = ""
+    holds_bytes: int = 0
+    reuse_bytes: int = 0
+    fits: bool = True
+    complete: bool = True
 
-    memory_level: str
-    peak_bytes: int
-    persistent_bytes: int
-    capacity_bytes: int | None = None
-
-class ValueLifetime:
-    """One value's residency, as positions in the function's value order.
-
-    Attributes:
-        binding: attribute; The parameter or authored binding name, unique in the function.
-        memory_level: attribute; The memory level the value occupies.
-        bytes: attribute; Bytes the value occupies at that level.
-        defined_at: attribute; Position the value becomes resident.
-        last_used_at: attribute; Position it may be released.
-        persistent: attribute; Whether it is held for the whole function.
-    """
-
-    binding: str
-    memory_level: str
-    bytes: int
-    defined_at: int
-    last_used_at: int
-    persistent: bool = False
 
 class RegionMemoryMetadata(IRMetadata):
-    """One Function's aggregate movement and placement conclusions."""
+    """One Function's aggregate memory conclusions."""
 
     solver_status: str
     topologies: tuple[str, ...] = ()
     traffic: Traffic = Traffic()
     footprint: Footprint | None = None
+    reuse_windows: tuple[ReuseWindow, ...] = ()
     lifetimes: tuple[ValueLifetime, ...] = ()
     peaks: tuple[MemoryLevelPeak, ...] = ()
     errors: tuple[str, ...] = ()
     advisories: tuple[str, ...] = ()
 ```
 
-Every traffic amount here is what a boundary's own relation reaches. The Op's
+##### `Traffic`
+
+```python
+class Spread[V]:
+    """One quantity, whole and as one unit of each topology level holds it.
+
+    Attributes:
+        logical: attribute; What the authored operation asks before replication.
+        total: attribute; What the whole execution asks.
+        per_unit: attribute; What one unit of each level holds, in topology order.
+    """
+
+    logical: V
+    total: V
+    per_unit: tuple[V, ...] = ()
+
+
+class Breakdown[V]:
+    """One category's quantities, split by kind."""
+
+    kinds: tuple[tuple[str, Spread[V]], ...] = ()
+
+
+class Traffic:
+    """Movement grouped by storage and communication boundary."""
+
+    storage: Breakdown[TrafficBytes] = Breakdown()
+    communication: Breakdown[TrafficBytes] = Breakdown()
+```
+
+Every traffic amount is what a boundary's own relation reaches. The Op's
 evaluator says which way each boundary moves and whether it materialises
 anything; it does not say how much, and an Op with no relation fails closed.
+
+| Field | How it is computed | Reads the target |
+|---|---|---|
+| `MemoryMetadata.topologies` | The effective Module topology levels, coarsest first. | No |
+| `MemoryMetadata.traffic` | One occurrence's per-boundary movement, grouped by storage and communication boundary. | No; projection reads resolved Mesh and topology extents. |
+| `MemoryMetadata.operands` | One occurrence's movement in order `(*call.args, call)`. | No |
+| `RegionMemoryMetadata.topologies` | The same effective Module topology levels. | No |
+| `RegionMemoryMetadata.traffic` | Every reachable occurrence. `logical` multiplies only loops the value varies in; `total` and `per_unit` multiply every enclosing loop. | No |
 
 - constraints:
   - One relation MUST answer for the whole program and for one unit, from one
@@ -335,46 +314,15 @@ anything; it does not say how much, and an Op with no relation fails closed.
     reaches rather than a full source per participant.
   - Each leaf's bytes are charged at the level that leaf sits at. A `UMAT` leaf
     in `Call.args` charges its own bytes at `rmem` and one appearing only in an
-    Op attribute charges nothing, so `whole` and an `operands` entry MUST NOT be
-    assumed equal for a Type whose leaves occupy several levels: the first groups
-    leaves by level, the second is one boundary's amount over all of them. Where
-    those bytes were placed enters neither.
+    Op attribute charges nothing, so a whole traffic amount and an `operands`
+    entry MUST NOT be assumed equal for a Type whose leaves occupy several
+    levels. Where those bytes were placed enters neither.
   - Two operands MAY name the same value; the `operands` split MUST keep their
     positions distinct, and MUST omit an entry it cannot state rather than emit
     it empty.
-
-Capacity is settled against the authored definition order, which fixes every
-buffer's lifetime before any of them is measured. For `gmem` and `smem`, exact
-polyhedral access relations may let the solver overlap a dead pointwise operand
-with its result or embed an `insert_slice` update in its result. Every logical
-SSA box remains in the model, including outside the container's lifetime. The
-concrete arrangement is not reported: no address or per-value buffer identity
-is a conclusion of this analysis. `rmem` is not address-solved and reports only
-the largest single projected logical value.
-
-- constraints:
-  - An access relation that keeps a parameter with a stated finite range is
-    exact and MAY prove overlap. A widened relation, and one with an unbounded
-    parameter, MUST NOT.
-  - Placement MUST be settled for the addressable levels `gmem` and `smem` only,
-    once per capacity domain that holds a buffer -- the whole target for a level
-    owned target-wide, one per owning position otherwise -- with two buffers in
-    one domain never live in the same bytes at once. Residency at another level
-    MUST NOT make a program unplaceable, and a level owned per unit of a topology
-    level other than the one being analysed MUST fail rather than be assumed.
-    Domains holding the same buffers are one question, decided once.
-  - `RegionMemoryMetadata.solver_status` MUST be `"feasible"`, including when
-    the function has no addressable value: the question was asked and there was
-    nothing to place. A domain that cannot be expressed or
-    does not settle in time MUST raise `AnalysisError` and leave no record. The
-    solver MUST stop at its first feasible assignment rather than spend the
-    remaining timeout proving a minimum. Its reported peak is that assignment's
-    actual address high-water mark, not a mathematical optimum. Capacity MUST
-    NOT restrict that address space: after solving, a high-water mark above
-    capacity MUST add a non-fatal `errors` entry and preserve the complete result.
-  - Every `Spread` MUST state a share for each declared topology level, not
-    only for the level the call selected, and the record MUST name those
-    levels once in `topologies` rather than beside each share.
+  - Every `Spread` MUST state a share for each declared topology level, not only
+    for the level the call selected, and the record MUST name those levels once
+    in `topologies` rather than beside each share.
   - A movement has two coordinates and MUST be stated in both. `storage` names
     the level the bytes entered or left. `communication` names the topology
     level whose boundary they crossed, which no storage level can answer: data
@@ -385,51 +333,254 @@ the largest single projected logical value.
     received and what it sent. A unit finer than the boundary MUST state no
     share of it -- crossing is what the units on either side do, and dividing
     the move among the units inside one states a move nobody made.
-  - A duration MUST take whichever of compute, storage movement and crossing
-    is longest, and MUST NOT sum them: one movement spends two resources over
-    one span of time. A crossing at a level the target publishes no rate for
-    MUST be stated and left untimed.
-  - A Call's `traffic` and `operands` MUST state one occurrence. Only the Function
-    record counts an occurrence as often as its authored loops repeat it; which
-    operand moved what belongs to the occurrence, not to the region total.
-  - A capacity conclusion MUST NOT correct or invent a movement number. What an
-    occurrence moves is counted once from its own boundaries, so placement and
-    traffic remain separate fields of one record. A window
-    whose start arrives at run time reads that start rather than becoming a full
-    read of its source and a write of its result.
+  - A duration MUST take whichever of compute, storage movement and crossing is
+    longest, and MUST NOT sum them: one movement spends two resources over one
+    span of time. A crossing at a level the target publishes no rate for MUST
+    be stated and left untimed.
+  - A Call's `traffic` and `operands` MUST state one occurrence. Only the
+    Function record counts an occurrence as often as its authored loops repeat
+    it.
+  - A capacity conclusion MUST NOT correct or invent a movement number. A
+    window whose start arrives at run time reads that start rather than becoming
+    a full read of its source and a write of its result.
+  - Which boundaries move is the Op's evaluator's answer and MUST NOT be read
+    off value lifetimes. A boundary it reports no direction on moves nothing.
+    The numbers that place a window MUST be read like any other operand: one
+    element per number, reached through the boundary's own relation onto the
+    flat leaves the operand holds, and charged at each reached leaf's own width.
+    An operation that writes at an address it is given reads that address the
+    same way.
+
+##### `Footprint`
+
+A footprint counts the unique addresses a program touches in the memory level
+a cache backs. It is stated per source buffer, named as a lifetime names one.
+
+```python
+class Footprint:
+    """Unique bytes one wave touches, or the lower bound when incomplete."""
+
+    buffers: tuple[tuple[str, Breakdown[int]], ...] = ()
+    complete: bool = True
+```
 
 | Field | How it is computed | Reads the target |
 |---|---|---|
-| `ValueLifetime.binding` | Use the parameter or binding name, suffixed with `:` and the line of the value's source span when it has one. Repeated names already differ by the printer's numeric suffix in definition order; the line locates the row in authored source, which a suffix cannot. A value with neither name nor span is `<value N>` in definition order. | No |
+| `Footprint.buffers` | Group reached address sets by source-buffer identity, union each group, count its elements, and pack the source dtype's bits into whole bytes. Each buffer has one memory-level kind whose `Spread` states the same count in `logical` and `total` and has no `per_unit` entries. | `MemoryHierarchyFacts` selects the level; [target §11](./target.md#11-target-facts-projection) supplies `TopologyFacts`. |
+| `Footprint.complete` | False when any contributing boundary is not exact, has no finite count, or belongs to a refused scope; otherwise true. | No |
+| `MemoryMetadata.footprint` | The unique addresses this occurrence's own boundaries reach at every enclosing loop's first iteration over one wave, or `None` when no wave can be stated. | As above |
+| `RegionMemoryMetadata.footprint` | The union of every Call's reached addresses below the Function, deduplicated per buffer before counting, or `None` when no wave can be stated. | As above |
+
+- constraints:
+  - Overlapping ranges into one buffer MUST be unioned before they are counted,
+    and the byte count MUST be `ceil(elements * dtype.bit_width / 8)`.
+  - Both directions contribute: a load and a store to that level each occupy the
+    cache. Only boundaries against that level are counted; a boundary against
+    another level MUST NOT enter.
+  - A boundary contributes only when its positional entry in
+    `MemoryMetadata.operands` reports a nonzero read or write. This MUST use the
+    same Op-evaluator answer as traffic; a boundary with no direction moves
+    nothing and MUST NOT enter the footprint.
+  - One window is defined, and no other: every enclosing loop's induction
+    variable is held at its first iteration, over one wave of units. A Call
+    states the footprint of its own boundaries; a Function states the union of
+    every Call below it, deduplicated per buffer before any byte count is taken.
+    A `LoopRegion` MUST NOT carry a footprint.
+  - A loop start MAY depend on a unit coordinate. Holding such a loop at its
+    first iteration MUST constrain it to that start expression, not to a
+    constant; the reached range then still varies with the coordinate.
+  - A unit coordinate MUST be eliminated by union over the wave, never by taking
+    the largest single unit's count. The two differ whenever units reach
+    different addresses.
+  - A program declaring more units than the target holds MUST NOT have them all
+    counted as concurrent. The wave is the first `wave_units` positions in the
+    mesh's own linear order, taken through `Mesh.layout`'s strides.
+  - Each buffer's count is one number. It MUST be stated in every counting
+    domain a `Spread` carries, because a union over units divides back into no
+    per-unit share.
+  - `Footprint.complete` is the only completeness marker. It is false when any
+    contributing boundary is not `AccessPrecision.EXACT`, has no finite count,
+    or belongs to a refused scope, and the stated bytes are then a lower bound.
+  - A footprint MUST be absent, not empty, when analysis cannot state the wave
+    it is taken over.
+
+##### `ValueLifetime`
+
+```python
+class ValueLifetime:
+    """One value's residency, as positions in the Function's value order."""
+
+    binding: str
+    memory_level: str
+    bytes: int
+    defined_at: int
+    last_used_at: int
+    persistent: bool = False
+```
+
+One ordinary expression event uses its operands and defines its result. A
+region adds separate binding and exit events: a mesh argument is used before
+its parameter is defined, and a loop initial value is used before its induction
+and carried parameters are defined. One representative loop-body iteration is
+recorded without expanding the trip count; a carried parameter spans entry to
+exit, and a yielded value remains live through the backedge event. Positions
+are monotonic across the whole Function, including nested and sibling regions.
+
+| Field | How it is computed | Reads the target |
+|---|---|---|
+| `ValueLifetime.binding` | Use the parameter or binding name, suffixed with `:` and the line of the value's source span when it has one. Repeated names differ by the printer's numeric suffix in definition order. A value with neither name nor span is `<value N>` in definition order. | No |
 | `ValueLifetime.memory_level` | Emit one lifetime per storage level occupied by the value's Type. | No |
 | `ValueLifetime.bytes` | Project the Type through every authored split at or coarser than the explicit level's `owner`, then take its logical bytes; a target-owned or undeclared level remains global. | `MemoryHierarchyFacts.explicit_levels[].owner` |
-| `ValueLifetime.defined_at` | Definition event on the function-wide structured SSA timeline. | No |
+| `ValueLifetime.defined_at` | Definition event on the Function-wide structured SSA timeline. | No |
 | `ValueLifetime.last_used_at` | Greatest ordinary-consumer, region-entry, loop-backedge, or region-exit use event; the final timeline event for a parameter. | No |
 | `ValueLifetime.persistent` | True for parameters and false for body allocations. | No |
+| `RegionMemoryMetadata.lifetimes` | Every value residency except a non-material view. | As above |
+
+- constraints:
+  - `Reshape` and `Transpose` describe bytes their operand already holds and
+    MUST NOT receive independent lifetimes. Every other result, including a
+    window, tuple field, or result that overwrites a destination, MUST allocate
+    its own. Analysis MUST use operation semantics for this distinction rather
+    than infer aliasing from layouts.
+  - A caller-owned parameter MUST NOT be reused. Donation is a contract with
+    the caller, not a conclusion this family may draw.
+
+##### `MemoryLevelPeak`
+
+Capacity is settled against authored definition order, which fixes every
+buffer's lifetime before any is measured. For `gmem` and `smem`, exact
+polyhedral access relations may let the solver overlap a dead pointwise operand
+with its result or embed an `insert_slice` update in its result. Every logical
+SSA box remains in the model. The concrete arrangement is not reported. `rmem`
+is not address-solved and reports only the largest single projected logical
+value.
+
+```python
+class MemoryLevelPeak:
+    """How much of one memory level a Function needs at its peak."""
+
+    memory_level: str
+    peak_bytes: int
+    persistent_bytes: int
+    capacity_bytes: int | None = None
+```
+
+| Field | How it is computed | Reads the target |
+|---|---|---|
 | `MemoryLevelPeak.memory_level` | Each storage level with at least one lifetime or traffic entry, sorted by name. | No |
 | `MemoryLevelPeak.peak_bytes` | For `gmem` and `smem`, the address high-water mark of the first feasible whole-Function placement. Exact pointwise relations and exact `insert_slice` partitions may permit overlap; widened or unknown relations do not. For `rmem`, the largest single projected logical value. | No |
 | `MemoryLevelPeak.persistent_bytes` | Sum of persistent lifetimes at that level. | No |
 | `MemoryLevelPeak.capacity_bytes` | Capacity of the matching explicit level, or `None` when unknown. | `MemoryHierarchyFacts.explicit_levels[].capacity_bytes` |
-| `MemoryMetadata.traffic` | One occurrence's per-boundary movement, grouped by storage and communication boundary. | No; projection reads resolved Mesh and topology extents. |
-| `MemoryMetadata.operands` | One occurrence's movement in order `(*call.args, call)`. | No |
-| `RegionMemoryMetadata.traffic` | Every reachable occurrence. `logical` multiplies only loops the value varies in; `total` and `per_unit` multiply every enclosing loop. | No |
-| `RegionMemoryMetadata.footprint` | `None` until a read-footprint analysis has produced a conclusion; it MUST NOT use an empty `Footprint` to mean “not computed”. | No |
-| `RegionMemoryMetadata.lifetimes` | Every value residency except a non-material view. | As above |
-| `RegionMemoryMetadata.peaks` | One `MemoryLevelPeak` per occupied or moved storage level. | As above |
-| `RegionMemoryMetadata.solver_status` | The validated whole-Function placement status. | No |
-| `RegionMemoryMetadata.errors` | One non-fatal error per placement peak exceeding capacity. | `MemoryHierarchyFacts.explicit_levels[].capacity_bytes` |
-| `RegionMemoryMetadata.advisories` | Lower-severity target-aware memory findings. | `MemoryHierarchyFacts` |
+| `RegionMemoryMetadata.peaks` | One peak per occupied or moved storage level. | As above |
+| `RegionMemoryMetadata.solver_status` | `"feasible"` after the whole-Function placement settles, including when there is no addressable value. | No |
+| `RegionMemoryMetadata.errors` | Non-fatal placement-capacity and cache-capacity failures. | `MemoryHierarchyFacts` |
+| `RegionMemoryMetadata.advisories` | Lower-severity target-aware memory findings recorded by this family. | `MemoryHierarchyFacts` |
 
-One ordinary expression event uses its operands and defines its result. A region
-adds separate binding and exit events: a mesh argument is used before its
-parameter is defined, and a loop initial value is used before its induction and
-carried parameters are defined. One representative loop-body iteration is
-recorded without expanding the trip count; a carried parameter spans entry to
-exit, and a yielded value remains live through the backedge event. Event
-positions are monotonic across the whole Function, including nested and sibling
-regions.
+- constraints:
+  - `RegionMemoryMetadata` MUST be attached per reachable `Function`; a peak
+    spans its live ranges and belongs to no single expression.
+  - An access relation that keeps a parameter with a stated finite range is
+    exact and MAY prove overlap. A widened relation, and one with an unbounded
+    parameter, MUST NOT.
+  - Placement MUST be settled for the addressable levels `gmem` and `smem` only,
+    once per capacity domain that holds a buffer -- the whole target for a level
+    owned target-wide, one per owning position otherwise -- with two buffers in
+    one domain never live in the same bytes at once. Residency at another level
+    MUST NOT make a program unplaceable, and a level owned per unit of a topology
+    other than the one being analysed MUST fail rather than be assumed. Domains
+    holding the same buffers are one question, decided once.
+  - A domain that cannot be expressed or does not settle in time MUST raise
+    `AnalysisError` and leave no record. The solver MUST stop at its first
+    feasible assignment rather than prove a minimum. Capacity MUST NOT restrict
+    the address space.
+  - A solved explicit-level peak exceeding capacity MUST add a non-fatal
+    `errors` entry, preserve the complete result, and MUST NOT fail the call.
 
-The family reads this target hierarchy:
+##### Cache occupancy
+
+A cache holds data because it will be read again, and whether it still holds it
+is decided by what was touched in between. This analysis states one row per
+buffer that is read again, naming the two axes a second read can come from: the
+loop whose next iteration reads it, and the mesh axis whose units read it at
+once. A buffer with neither states no row.
+
+| Field | How it is computed | Reads the target |
+|---|---|---|
+| `ReuseWindow.buffer` | The source buffer's lifetime label. | No |
+| `ReuseWindow.time` | The outermost enclosing loop whose different iterations reach the same addresses, named by its induction variable; empty when no loop supplies a second read. | No |
+| `ReuseWindow.space` | The mesh axis whose different coordinates reach the same addresses; empty when no mesh axis supplies a second read. | No |
+| `ReuseWindow.holds_bytes` | Unique bytes of every buffer the whole wave touches while this buffer must remain resident. | `MemoryHierarchyFacts` selects the backed level; [target §11](./target.md#11-target-facts-projection) supplies `TopologyFacts`. |
+| `ReuseWindow.reuse_bytes` | `(time trips * space units - 1)` times this buffer's unique bytes in the window; an absent axis contributes one. | As above |
+| `ReuseWindow.fits` | True exactly when `holds_bytes` is less than the cache capacity. | `MemoryHierarchyFacts.implicit_levels[]` |
+| `ReuseWindow.complete` | False when any boundary contributing to `holds_bytes` is inexact, uncountable, or refused; otherwise true. | No |
+| `RegionMemoryMetadata.reuse_windows` | One row for every buffer with a time or space reuse axis and nonzero savings. | As above |
+
+- constraints:
+  - The stated bytes are everything the whole wave touches while that buffer
+    must stay resident, every buffer included, not only the one read again:
+    the others are what evict it.
+  - Cache lines are not modelled. Reached addresses are packed by element
+    width, so two accesses to neighbouring words of one hardware cache line
+    remain two distinct touches here.
+  - A read by another unit of the same wave counts. On a target whose units
+    share one cache, data several units read at once is the common case, and a
+    model counting only one unit returning later would state no reuse at all
+    for a schedule giving each unit one output tile.
+  - The parallel reuse axis is a TileFoundry extension. The reuse-distance
+    model it follows (Falcon, PLDI 2024) states a single-threaded program;
+    unioning addresses across concurrent units has neither a published model
+    behind it nor hardware validation here.
+  - A mesh axis supplies reuse exactly when one unit reaches the same addresses
+    as the wave union along that axis. The spatial repeat count is how many
+    units in the wave map onto those same addresses. The space comparison reads
+    the wave relation from the device view and the one-unit relation from the
+    unit view. The time axis reads the raw narrow relation, retaining mesh
+    parameters and applying no wave limit. `holds_bytes` reads the narrow
+    relation, limits it to the wave, and projects out mesh parameters.
+  - Under nested mesh regions, a reuse row states its space axis against the
+    innermost enclosing mesh. Outer execution meshes are not composed into
+    that axis label.
+  - The window is the loop axis when there is one, and the mesh axis alone
+    otherwise, because units reading at once are already inside one iteration
+    of the loop that carries the later read.
+  - A time window is a loop-granularity over-approximation. A true reuse
+    distance starts at the previous touch of the same cache line; this window
+    covers a whole iteration of the carrying loop. For a complete row,
+    `holds_bytes` is therefore never below the true byte reuse distance:
+    `fits=yes` is sound, while `fits=no` may be conservative. An incomplete row
+    retains the lower-bound rule below and supports neither conclusion.
+  - Rows MUST NOT be summed. One row's window lies inside another's whenever
+    its axis is nested inside, so a row that fits implies those nested in it
+    fit.
+  - Rows MUST be ordered by `reuse_bytes`, largest first. Equal reuse amounts retain
+    their derivation order.
+  - Data read once states no row; its bytes still enter every row whose window
+    contains it.
+  - A row whose computed reuse is zero states no row.
+  - A window above capacity MUST add one non-fatal `errors` entry, regardless
+    of how many buffer rows share it, and MUST NOT fail the call.
+  - The stated bytes are a lower bound when any contributing boundary is
+    inexact, exactly as a footprint is.
+  - The capacity is stated per one instance of the cache's `scope`, and this
+    analysis compares one wave against one instance. A deployment that spreads
+    one wave across several instances is not modelled.
+  - Per-unit control flow is out of scope: HIR states no conditional region, so
+    two units differ only by the iteration domain a coordinate gives them.
+  - This is the capacity judgement of an idealised fully associative LRU cache.
+    Miss counts, miss rates and hardware replacement policy are not modelled.
+
+The report identity, not `RegionMemoryMetadata`, states the program-dependent
+machine context. Its wave is `min(declared units, units the target runs at
+once)` over the level selected by `TopologyFacts.parallel_level`; it is the top-level
+`wave` field in JSON and appears once on the `analysis` text line. Cache level
+and capacity remain Target facts and appear in this report only when they decide
+a cache-capacity finding.
+
+##### Target facts
+
+The family reads the target hierarchy and physical unit counts stated once in
+[target §11](./target.md#11-target-facts-projection), because `memory` and
+`performance` both consume them.
 
 ```python
 class MemoryRelationKind(Enum):
@@ -437,6 +588,7 @@ class MemoryRelationKind(Enum):
 
     CACHES = "caches"
     SHARES_CAPACITY_WITH = "shares_capacity_with"
+
 
 class ExplicitMemoryLevelFacts:
     """A level a program places values in by name.
@@ -453,6 +605,7 @@ class ExplicitMemoryLevelFacts:
     scope: str
     owner: str
 
+
 class ImplicitMemoryLevelFacts:
     """A level traffic passes through without being placed there.
 
@@ -465,6 +618,7 @@ class ImplicitMemoryLevelFacts:
     name: str
     capacity_bytes: int | None
     scope: str
+
 
 class MemoryLevelRelation:
     """One edge between two memory levels.
@@ -481,6 +635,7 @@ class MemoryLevelRelation:
     far: str
     shared_capacity_bytes: int | None = None
 
+
 class MemoryHierarchyFacts:
     """Every memory level of one target, as a flat graph.
 
@@ -495,30 +650,65 @@ class MemoryHierarchyFacts:
     relations: tuple[MemoryLevelRelation, ...]
 ```
 
-Requesting memory adds one Function memory line and one line per finding:
+- constraints:
+  - The memory levels MUST be two flat tuples with a separate relation edge
+    list.
+  - A GPU projection MUST cover the explicit levels a program can name and the
+    caches traffic passes through, and MUST state that L1 caches L2, L2 caches
+    global memory, and L1 divides one physical block with shared memory. A target
+    with no sharing MUST express that with no sharing edge.
+  - An implicit level MUST NOT receive a fixed capacity where its usable
+    capacity depends on the program; that capacity MUST be derived from the
+    sharing edge and the sharing level's measured peak.
+  - Every explicit level MUST carry an `owner` supplied by the Target. It MUST
+    be a declared Target topology or `target`. An implicit cache MUST NOT carry
+    an owner.
+  - Analysis MUST NOT infer memory ownership from a storage level's name or
+    capacity scope.
+
+##### Printed and JSON surface
+
+Requesting memory adds one Function line and one line per finding:
 
 ```text
-memory traffic=<memory-level>:r<int>/w<int>@logical,r<int>/w<int>@total,r<int>/w<int>@<topology>[,...] peak=<level>:<int>[,...]
-error="<text>"
-advisory="<text>"
+memory traffic=<memory-level>:r<bytes>/w<bytes>@logical,r<bytes>/w<bytes>@total,r<bytes>/w<bytes>@<topology>[,...] footprint=<buffer>:<bytes>[;<buffer>:<bytes>] peak=<level>:<bytes>[,...] persistent=<level>:<bytes>[,...]
+  buffer=<buffer> holds=<bytes> time=<loop|none> space=<mesh-axis|none> reuse=<bytes> fits=<yes|no>
+  error="<text>"
+  advisory="<text>"
 ```
 
-Each error and advisory is its own quoted and escaped line. Every measured Call
-receives a `memory` annotation; its `operands` split is emitted only when asked
-for ([cli Analyze](./cli.md#analyze)):
+The `<bytes>` form selects the largest of `B`, `KB`, `MB`, and `GB` whose unit
+the value reaches, with 1024 between adjacent units. `B` is an integer; every
+larger unit has two decimal places. Zero is `0`. This one form is used for every
+human-readable byte count, including error text; JSON keeps raw byte integers.
+
+Each buffer, error, and advisory is its own line indented beneath the `memory`
+family line. Errors and advisories are quoted and escaped. Every measured Call
+receives a `memory` annotation; `operands` is emitted only when asked for
+([cli Analyze](./cli.md#analyze)):
 
 ```text
-memory traffic=<memory-level>:r<int>/w<int>@logical,r<int>/w<int>@total,r<int>/w<int>@<topology>[,...] [operands=<position>:r<int>/w<int>[;<position>:...]]
+memory traffic=<memory-level>:r<bytes>/w<bytes>@logical,r<bytes>/w<bytes>@total,r<bytes>/w<bytes>@<topology>[,...] footprint=<buffer>:<bytes>[;<buffer>:<bytes>] [operands=<position>:r<bytes>/w<bytes>[;<position>:...]]
 ```
 
-Call and Function JSON projections are both under `memory`. The Function's full
-projection is under `function_records.memory`:
+In the printed `footprint` field, a buffer uses the same value label as a
+lifetime binding and that label may itself contain `:` (for example,
+`v0:57:1.00KB`). The byte count is the formatted value after the last colon.
+
+Missing optional conclusions omit their whole printed field. Call and Function
+JSON projections are both under `memory`. The Function's full projection is
+under `function_records.memory`:
 
 ```text
 {"topologies": [<level>, ...],
  "traffic": {"storage": {<memory-level>: <spread>, ...},
              "communication": {<topology-level>: <spread>, ...}},
- "footprint": null,
+ "footprint": {"buffers": {<buffer>: {<memory-level>: <spread>}, ...},
+               "complete": <bool>} | null,
+ "reuse_windows": [{"buffer": <name>, "time": <loop|"">,
+                     "space": <mesh-axis|"">, "holds_bytes": <int>,
+                     "reuse_bytes": <int>, "fits": <bool>,
+                     "complete": <bool>}, ...],
  "lifetimes": [{"binding": <name>, "memory_level": <level>, "bytes": <int>,
                 "defined_at": <int>, "last_used_at": <int>,
                 "persistent": <bool>}, ...],
@@ -530,44 +720,11 @@ projection is under `function_records.memory`:
 ```
 
 - constraints:
-  - `RegionMemoryMetadata` MUST be attached per reachable `Function`; a peak spans its
-    live ranges and belongs to no single expression.
-  - `Reshape` and `Transpose` describe bytes their operand already holds and
-    MUST NOT receive independent lifetimes. Every other result, a window and a
-    field of a tuple and one that overwrites a destination included, MUST
-    allocate its own: landing in an operand's buffer is a fact about a plan,
-    and no plan has been made here. Analysis uses operation semantics for this
-    distinction rather than inferring aliasing from layouts.
-  - A caller-owned parameter MUST NOT be reused. Donation is a contract with
-    the caller, not a conclusion this family may draw.
-  - Which boundaries move is the Op's evaluator's answer and MUST NOT be read
-    off the lifetimes above: a boundary it reports no direction on moves
-    nothing, which is what a `Reshape` and a `Slice` say of their tensor source
-    and their result, while a `Transpose` shares its operand's bytes and still
-    reads and writes them because its evaluator materialises the permutation.
-    The numbers that place a window MUST be read like any other operand: one
-    element per number, reached through the boundary's own relation onto the
-    flat leaves the operand holds, and charged at each reached leaf's own width.
-    An operation that writes at an address it is given reads that address the
-    same way.
-  - The memory levels MUST be two flat tuples with a separate relation edge list.
-  - A GPU projection MUST cover the explicit levels a program can name and the
-    caches traffic passes through, and MUST state that L1 caches L2, that L2
-    caches global memory, and that L1 divides one physical block with shared
-    memory. A target with no sharing MUST express that with no sharing edge.
-  - An implicit level MUST NOT receive a fixed capacity where its usable capacity
-    depends on the program; that capacity MUST be derived from the sharing edge
-    and the sharing level's measured peak.
-  - Every explicit level MUST carry an `owner` supplied by the Target. It MUST be
-    a declared Target topology or `target`. An implicit cache MUST NOT carry an
-    owner.
-  - Analysis MUST NOT infer memory ownership from a storage level's name or
-    capacity scope.
-  - A solved explicit-level peak exceeding capacity, whether from one value or
-    the aggregate placement, MUST produce a report `error` and MUST NOT fail the
-    call. This contract produces no authored-loop cache conclusion; an
-    `advisory` MUST come from a recorded Function-level finding rather than a
-    report-layer reconstruction.
+  - Text and JSON MUST project analysis conclusions from these records. The
+    report identity's `wave` is read from the resolved Module Target and the
+    program's declared units and MUST NOT be copied into the memory record.
+  - A missing footprint MUST be JSON `null`; it MUST NOT be represented by an
+    empty `Footprint`.
 
 #### 1.2.3 `roofline`
 
@@ -791,28 +948,15 @@ Function summary fields are:
 | Field | How it is computed | Reads the target |
 |---|---|---|
 | `timeline` | `[0, local makespan * waves)`, where the local makespan is the end of the CTA-local timeline, or zero with no work. Its duration is the prediction. | Through `waves` |
-| `waves` | `ceil(N / P)`, where `N` is the static extent of the root topology selected by `ParallelCapacityFacts.topology` and `P` is `parallel_units`. | `ParallelCapacityFacts` |
+| `waves` | `ceil(N / P)`, where `N` is the static extent of the topology selected by `TopologyFacts.parallel_level` and `P` is that level's `max_physical_units`. | `TopologyFacts` |
 
 Occurrence intervals remain CTA-local. They are not copied once per wave, and
-neither the root topology extent nor `parallel_units` changes them. The capacity
-`P` is compiler policy for concurrent instances; it is distinct from the
-per-unit rates in `ThroughputFacts` even when both projections derive from the
-same physical unit count today.
-
-The family reads this target projection:
-
-```python
-class ParallelCapacityFacts:
-    """Carry the parallel capacity assumed by performance analysis.
-
-    Attributes:
-        topology: attribute; Topology level being measured over.
-        parallel_units: attribute; Instances admitted concurrently.
-    """
-
-    topology: str
-    parallel_units: int
-```
+neither the root topology extent nor `max_physical_units` changes them. The capacity
+`P` is the machine-side position count; the mapping of one CTA to one SM is
+compiler policy. It is distinct from the per-unit rates in `ThroughputFacts`
+even when both projections derive from the same physical unit count today. The
+aggregate itself is stated once in [target §11](./target.md#11-target-facts-projection),
+because `memory` reads it too.
 
 Requesting performance adds this Function verdict to the summary:
 
@@ -910,7 +1054,7 @@ model.
     `waves`; there MUST be no second field restating the local makespan or the
     scaled estimate, and none restating how the layout was reached -- it is
     exact for the model it states.
-  - `parallel_units` is compiler policy over hardware facts. It MUST NOT enter
+  - `max_physical_units` MUST NOT enter
     one-unit rates or the CTA-local layout, and is not a program rewrite.
   - The buffers a plan keeps live MUST have been placed by `memory` before a
     time is reported for it. A successful dependency records
@@ -1057,8 +1201,8 @@ def analyze(
     first-occurrence order, resolve their union dependency closure, and execute
     every member once.
   - `topology_level` MUST name one effective Module topology. When omitted, it
-    MUST default to the coarsest effective topology the target states a
-    `ParallelCapacityFacts` for. A program may name a level the host places
+    MUST default to the coarsest effective topology whose `TopologyLevelFacts`
+    states `max_physical_units`. A program may name a level the host places
     rather than the machine runs -- several cards are one deployment's shape,
     not one card's -- and measuring per such a level would ask the machine for
     a unit it publishes no rate for. When the target answers for none of the
@@ -1066,9 +1210,9 @@ def analyze(
     the level rather than the absence of one; when the Module declares none,
     `topology_level` MUST remain `None` and no per-unit projection divides.
     `AnalysisResult.topology_level` MUST record the resolved answer.
-  - A target MUST answer `PerformanceServiceFacts` and `ParallelCapacityFacts`
-    for the level it is asked about, and MUST refuse a level it publishes no
-    rate for rather than answering for a different one. What one unit gets
+  - A target MUST answer `PerformanceServiceFacts` and state
+    `TopologyLevelFacts.max_physical_units` for the level it is asked about,
+    and MUST refuse a level it publishes no rate for rather than answering for a different one. What one unit gets
     through is the device peak over however many of that unit the device holds,
     so the same program measured at two levels states the same work against
     proportionally different rates.
@@ -1137,17 +1281,21 @@ def analyze(
 
 ### 2.1 Shared IterationScope and Access
 
-The normalized HIR is visited once per `analyze()` call. That visit produces a
-`IterationScope` tree parallel to Function/LoopRegion nesting and `Access` relations
-for the narrow and device views. `IterationScope.domain` is the accumulated
-authored loop domain; `IterationScope.accesses` and `IterationScope.refused` are
-the shared family inputs for movement and any later read-footprint conclusion.
+The normalized HIR is visited once per `analyze()` call. That visit produces an
+`IterationScope` tree parallel to Function, LoopRegion, and MeshRegion nesting
+and `Access` relations for the narrow and device views. A mesh scope adds no
+iteration dimension: it keeps its parent's depth and domain, so the first
+`depth` input dimensions of an access relation remain the enclosing loops.
+`IterationScope.domain` is the accumulated authored loop domain;
+`IterationScope.accesses` and `IterationScope.refused` are the shared family
+inputs for movement and footprint conclusions.
 An input `Access` stores its original Call boundary index as well as its relation
-and allocation expression; an output stores `input_index=None`. Failed boundaries
-remain absent without shifting the index on later successful inputs. Storage level
-and element width are read from the allocation type. A refused descendant makes
-its owning scope unknown for that view. Non-affine runtime indices retain the
-widest legal access approximation.
+and allocation expression; an output stores `input_index=None` and its own output
+boundary index, which is the tuple field it answers for. Failed boundaries remain
+absent without shifting the index on later successful inputs or outputs. Storage
+level and element width are read from the allocation type. A refused descendant
+makes its owning scope unknown for that view. Non-affine runtime indices retain
+the widest legal access approximation.
 Normalization clones each reached Function call site independently. Within one
 call site, source expressions shared by identity remain one shared expression
 in the clone; sharing never aliases the independently cloned body of another
@@ -1163,6 +1311,10 @@ widening; the two modules do not define a second affine graph representation.
     whole affine expression with each such leaf as one identity-deduplicated
     isl parameter constrained by that range. A leaf without a range MUST be
     refused.
+  - `IterationScope.domain_params` MUST map each of those parameter names back
+    to the value it stands for, because the name itself carries no meaning and
+    a reader that must recognise a unit coordinate cannot re-derive it without
+    restating how the name was made.
   - A loop `step` MUST be a literal; a parametric stride has no isl
     representation.
   - `cardinality` MUST enumerate every feasible integer point of a parameter box

@@ -107,7 +107,7 @@ class Traffic:
 
 @dataclass(frozen=True)
 class Footprint:
-    """Unique read bytes by source buffer and memory-level counting domain."""
+    """Unique bytes one wave touches, by source buffer and memory level."""
 
     buffers: tuple[tuple[str, Breakdown[int]], ...] = ()
     complete: bool = True
@@ -167,6 +167,26 @@ class ValueLifetime:
 
 
 @dataclass(frozen=True)
+class ReuseWindow:
+    """One buffer's re-reads, and what keeping it costs the cache.
+
+    ``time`` is the loop whose next iteration reads it again and ``space`` the
+    mesh axis whose units read it at once; either may be absent. ``holds`` is
+    everything the wave touches while it must stay resident -- other buffers
+    included, because they are what evicts it -- and ``reuse`` the bytes that
+    are not fetched again once it does.
+    """
+
+    buffer: str
+    time: str = ""
+    space: str = ""
+    holds_bytes: int = 0
+    reuse_bytes: int = 0
+    fits: bool = True
+    complete: bool = True
+
+
+@dataclass(frozen=True)
 class RegionMemoryMetadata(IRMetadata):
     """Record one region's memory behavior against a target hierarchy.
 
@@ -179,6 +199,7 @@ class RegionMemoryMetadata(IRMetadata):
     topologies: tuple[str, ...] = ()
     traffic: Traffic = Traffic()
     footprint: Footprint | None = None
+    reuse_windows: tuple[ReuseWindow, ...] = ()
     lifetimes: tuple[ValueLifetime, ...] = ()
     peaks: tuple[MemoryLevelPeak, ...] = ()
     errors: tuple[str, ...] = ()
@@ -260,6 +281,7 @@ __all__ = [
     "PerformanceMetadata",
     "PerformanceSummaryMetadata",
     "RegionMemoryMetadata",
+    "ReuseWindow",
     "RooflineMetadata",
     "Spread",
     "TimelineMetadata",

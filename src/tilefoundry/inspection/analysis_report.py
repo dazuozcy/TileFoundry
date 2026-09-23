@@ -9,6 +9,7 @@ from tilefoundry.analysis.metadata import (
     ComputeCostMetadata,
     PerformanceSummaryMetadata,
     RegionMemoryMetadata,
+    ReuseWindow,
     RooflineMetadata,
 )
 from tilefoundry.analysis.report import _type_text as _type_text
@@ -87,12 +88,16 @@ def _summary(
     selected: frozenset[type[IRMetadata]],
 ) -> tuple[IRMetadata, ...]:
     """One record per summary line: identity, selection, then findings."""
+    wave = data["wave"]
+    counted = wave["counted"]
+    declared = wave["declared"]
     views: list[IRMetadata] = [
         ReportIdentity(
             target=data["target"],
             module=data["module"],
             function=data["function"],
             topology=data["topology"] or "none",
+            wave=f"{counted}/{declared}" if counted and declared else "",
         ),
         ReportSelection(requested=tuple(data["requested"]), executed=tuple(data["executed"])),
     ]
@@ -103,6 +108,7 @@ def _summary(
         assert memory is not None
         views.append(memory)
         if RegionMemoryMetadata in selected:
+            views.extend(memory.reuse_windows)
             views.extend(ErrorSummary(Prose(note)) for note in memory.errors)
             views.extend(AdvisorySummary(Prose(note)) for note in memory.advisories)
     if "roofline" in function_records:
@@ -126,7 +132,11 @@ def report(result: AnalysisResult) -> dict[str, object]:
 
 def render_text(rendering: AnalysisRendering) -> str:
     """Render one stable comment line per report conclusion."""
-    return "\n".join(f"# {render_comment(view)}" for view in rendering.summary)
+    nested = (ReuseWindow, ErrorSummary, AdvisorySummary)
+    return "\n".join(
+        f"# {'  ' if isinstance(view, nested) else ''}{render_comment(view)}"
+        for view in rendering.summary
+    )
 
 
 __all__ = [

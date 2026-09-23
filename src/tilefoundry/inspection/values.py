@@ -8,6 +8,7 @@ from dataclasses import dataclass, fields, is_dataclass
 
 from tilefoundry.ir.core.metadata import IRMetadata
 from tilefoundry.ir.core.values import TripInterval
+from tilefoundry.utils.units import format_bytes
 
 PAIR, PER_UNIT, ENTRY, ENTRIES, FIELD, FIELDS, PARTS, TRIPS = (
     "/",
@@ -33,6 +34,7 @@ class ReportIdentity(IRMetadata):
     module: str = ""
     function: str = ""
     topology: str = "none"
+    wave: str = ""
 
 
 @dataclass(frozen=True)
@@ -80,7 +82,7 @@ class CommentPrinter:
         return json.dumps(str(value))
 
     def print_TrafficBytes(self, value):
-        return f"r{value.read}{PAIR}w{value.write}"
+        return f"r{format_bytes(value.read)}{PAIR}w{format_bytes(value.write)}"
 
     def print_TripInterval(self, value):
         if value.trips <= 1:
@@ -105,6 +107,8 @@ class CommentPrinter:
             elif self._empty_without_default(value):
                 continue
             out.append(f"{key.replace('_', '-')}={self.print(value)}")
+        if not family:
+            return FIELDS.join(out)
         return FIELDS.join([family, *out]) if out else family
 
     def _single(self, family, value, default=_UNSET):
@@ -130,6 +134,15 @@ class CommentPrinter:
             kind: self._spread(spread, topologies, logical=logical) for kind, spread in held.kinds
         }
 
+    @staticmethod
+    def _footprint(footprint):
+        if footprint is None:
+            return {}
+        return {
+            name: format_bytes(sum(spread.total for _level, spread in breakdown.kinds))
+            for name, breakdown in footprint.buffers
+        }
+
     def print_ComputeCostMetadata(self, record, **_):
         return self._record(
             "compute-cost",
@@ -141,7 +154,7 @@ class CommentPrinter:
 
     def print_MemoryMetadata(self, record, *, opt_in=frozenset()):
         traffic = self._breakdown(record.traffic.storage, record.topologies)
-        values = [("traffic", traffic)]
+        values = [("traffic", traffic), ("footprint", self._footprint(record.footprint))]
         if "operands" in opt_in:
             last = len(record.operands) - 1
             operands = {
@@ -156,10 +169,35 @@ class CommentPrinter:
             "memory",
             (
                 ("traffic", self._breakdown(record.traffic.storage, record.topologies)),
-                ("peak", {item.memory_level: item.peak_bytes for item in record.peaks}),
-                ("persistent", sum(item.persistent_bytes for item in record.peaks), 0),
-                ("errors", len(record.errors), 0),
-                ("advisories", len(record.advisories), 0),
+                ("footprint", self._footprint(record.footprint)),
+                (
+                    "peak",
+                    {
+                        item.memory_level: format_bytes(item.peak_bytes)
+                        for item in record.peaks
+                    },
+                ),
+                (
+                    "persistent",
+                    {
+                        item.memory_level: format_bytes(item.persistent_bytes)
+                        for item in record.peaks
+                        if item.persistent_bytes
+                    },
+                ),
+            ),
+        )
+
+    def print_ReuseWindow(self, record, **_):
+        return self._record(
+            "",
+            (
+                ("buffer", record.buffer),
+                ("holds", format_bytes(record.holds_bytes)),
+                ("time", record.time or "none"),
+                ("space", record.space or "none"),
+                ("reuse", format_bytes(record.reuse_bytes)),
+                ("fits", "yes" if record.fits else "no"),
             ),
         )
 
@@ -192,6 +230,7 @@ class CommentPrinter:
                 ("module", record.module, ""),
                 ("function", record.function, ""),
                 ("topology", record.topology, "none"),
+                ("wave", record.wave, ""),
             ),
         )
 
