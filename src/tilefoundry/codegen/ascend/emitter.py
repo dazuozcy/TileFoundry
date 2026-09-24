@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from tilefoundry.codegen.emitter import CppEmitter
 from tilefoundry.ir.tir.stmts import MeshScope
-from tilefoundry.ir.types.shard.layout import ComposedLayout
-from tilefoundry.ir.types.shard.mesh import Mesh
+from tilefoundry.ir.types.layout import ComposedLayout
+from tilefoundry.ir.types.mesh import Mesh
 from tilefoundry.target.facts import TopologyFacts
 
 

@@ -73,7 +73,7 @@ from transformers import Qwen3Config
 
 from tilefoundry import func, module
 from tilefoundry.dsl import ConstTensor, DimVar, Mesh, Tensor, tf  # noqa: F401 -- used by @func bodies
-from tilefoundry.ir.types.shard import Topology
+from tilefoundry.ir.types import Topology
 from tilefoundry.target import AscendTarget
 
 # the checker/analyzer AST walk recurses per unrolled layer (28 of them);

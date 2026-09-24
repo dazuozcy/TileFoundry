@@ -14,8 +14,8 @@ from tilefoundry.codegen.ascend.context import AscendCodegenContext
 from tilefoundry.ir.core import Var
 from tilefoundry.ir.tir.memory.tensor_view import TensorView
 from tilefoundry.ir.tir.stmts import LetStmt
-from tilefoundry.ir.types.shard.mesh import Mesh
-from tilefoundry.ir.types.shard.shard_layout import (
+from tilefoundry.ir.types.mesh import Mesh
+from tilefoundry.ir.types.shard_layout import (
     Broadcast,
     shard_layout_of,
 )
