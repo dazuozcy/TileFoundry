@@ -7,10 +7,10 @@ from dataclasses import dataclass
 from tilefoundry.analysis.api import AnalysisResult
 from tilefoundry.analysis.metadata import (
     ComputeCostMetadata,
-    MemoryMetadata,
     PerformanceSummaryMetadata,
+    RegionMemoryMetadata,
+    ReuseWindow,
     RooflineMetadata,
-    TrafficMetadata,
 )
 from tilefoundry.analysis.report import _type_text as _type_text
 from tilefoundry.analysis.report import (
@@ -23,12 +23,11 @@ from tilefoundry.analysis.report import (
 from tilefoundry.inspection.python_printer import HirPrinter, PythonPrintOptions
 from tilefoundry.inspection.values import (
     AdvisorySummary,
-    MemorySummary,
+    ErrorSummary,
     PerformanceSummaryView,
     Prose,
     ReportIdentity,
     ReportSelection,
-    peak_footprint,
     render_comment,
 )
 from tilefoundry.ir.core import IRMetadata, get_metadata
@@ -49,9 +48,7 @@ def selected_types(result: AnalysisResult) -> tuple[type[IRMetadata], ...]:
     return _selected_types(result.module, result.analyses, result.metadata_types)
 
 
-def render_analysis(
-    result: AnalysisResult, *, operands: bool = False
-) -> AnalysisRendering:
+def render_analysis(result: AnalysisResult, *, operands: bool = False) -> AnalysisRendering:
     """Render one result once for both annotated source and report data."""
     selected_types_ = selected_types(result)
     rendered = HirPrinter().render(
@@ -91,25 +88,28 @@ def _summary(
     selected: frozenset[type[IRMetadata]],
 ) -> tuple[IRMetadata, ...]:
     """One record per summary line: identity, selection, then findings."""
+    wave = data["wave"]
+    counted = wave["counted"]
+    declared = wave["declared"]
     views: list[IRMetadata] = [
         ReportIdentity(
             target=data["target"],
             module=data["module"],
             function=data["function"],
             topology=data["topology"] or "none",
+            wave=f"{counted}/{declared}" if counted and declared else "",
         ),
-        ReportSelection(
-            requested=tuple(data["requested"]), executed=tuple(data["executed"])
-        ),
+        ReportSelection(requested=tuple(data["requested"]), executed=tuple(data["executed"])),
     ]
     if "totals" in data and "compute-cost" in data["executed"]:
         views.append(get_metadata(function, ComputeCostMetadata) or ComputeCostMetadata())
-    if "traffic" in function_records:
-        views.append(get_metadata(function, TrafficMetadata) or TrafficMetadata())
     if "memory" in function_records:
-        memory = get_metadata(function, MemoryMetadata)
-        views.append(MemorySummary(peak_footprint(memory)))
-        if MemoryMetadata in selected:
+        memory = get_metadata(function, RegionMemoryMetadata)
+        assert memory is not None
+        views.append(memory)
+        if RegionMemoryMetadata in selected:
+            views.extend(memory.reuse_windows)
+            views.extend(ErrorSummary(Prose(note)) for note in memory.errors)
             views.extend(AdvisorySummary(Prose(note)) for note in memory.advisories)
     if "roofline" in function_records:
         views.append(get_metadata(function, RooflineMetadata))
@@ -132,7 +132,11 @@ def report(result: AnalysisResult) -> dict[str, object]:
 
 def render_text(rendering: AnalysisRendering) -> str:
     """Render one stable comment line per report conclusion."""
-    return "\n".join(f"# {render_comment(view)}" for view in rendering.summary)
+    nested = (ReuseWindow, ErrorSummary, AdvisorySummary)
+    return "\n".join(
+        f"# {'  ' if isinstance(view, nested) else ''}{render_comment(view)}"
+        for view in rendering.summary
+    )
 
 
 __all__ = [

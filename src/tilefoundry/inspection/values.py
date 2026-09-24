@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 
 from tilefoundry.ir.core.metadata import IRMetadata
 from tilefoundry.ir.core.values import TripInterval
+from tilefoundry.utils.units import format_bytes
 
 PAIR, PER_UNIT, ENTRY, ENTRIES, FIELD, FIELDS, PARTS, TRIPS = (
     "/",
@@ -33,6 +34,7 @@ class ReportIdentity(IRMetadata):
     module: str = ""
     function: str = ""
     topology: str = "none"
+    wave: str = ""
 
 
 @dataclass(frozen=True)
@@ -42,12 +44,12 @@ class ReportSelection(IRMetadata):
 
 
 @dataclass(frozen=True)
-class MemorySummary(IRMetadata):
-    peak_bytes: dict[str, int] = field(default_factory=dict)
+class AdvisorySummary(IRMetadata):
+    text: Prose
 
 
 @dataclass(frozen=True)
-class AdvisorySummary(IRMetadata):
+class ErrorSummary(IRMetadata):
     text: Prose
 
 
@@ -80,7 +82,7 @@ class CommentPrinter:
         return json.dumps(str(value))
 
     def print_TrafficBytes(self, value):
-        return f"r{value.read}{PAIR}w{value.write}"
+        return f"r{format_bytes(value.read)}{PAIR}w{format_bytes(value.write)}"
 
     def print_TripInterval(self, value):
         if value.trips <= 1:
@@ -105,6 +107,8 @@ class CommentPrinter:
             elif self._empty_without_default(value):
                 continue
             out.append(f"{key.replace('_', '-')}={self.print(value)}")
+        if not family:
+            return FIELDS.join(out)
         return FIELDS.join([family, *out]) if out else family
 
     def _single(self, family, value, default=_UNSET):
@@ -127,8 +131,16 @@ class CommentPrinter:
 
     def _breakdown(self, held, topologies, *, logical=True):
         return {
-            kind: self._spread(spread, topologies, logical=logical)
-            for kind, spread in held.kinds
+            kind: self._spread(spread, topologies, logical=logical) for kind, spread in held.kinds
+        }
+
+    @staticmethod
+    def _footprint(footprint):
+        if footprint is None:
+            return {}
+        return {
+            name: format_bytes(sum(spread.total for _level, spread in breakdown.kinds))
+            for name, breakdown in footprint.buffers
         }
 
     def print_ComputeCostMetadata(self, record, **_):
@@ -140,9 +152,9 @@ class CommentPrinter:
             ),
         )
 
-    def print_TrafficMetadata(self, record, *, opt_in=frozenset()):
-        traffic = self._breakdown(record.storage, record.topologies, logical=False)
-        values = [("traffic", traffic)]
+    def print_MemoryMetadata(self, record, *, opt_in=frozenset()):
+        traffic = self._breakdown(record.traffic.storage, record.topologies)
+        values = [("traffic", traffic), ("footprint", self._footprint(record.footprint))]
         if "operands" in opt_in:
             last = len(record.operands) - 1
             operands = {
@@ -150,28 +162,43 @@ class CommentPrinter:
                 for index, moved in enumerate(record.operands)
             }
             values.append(("operands", operands))
-        return self._record("traffic", values)
+        return self._record("memory", values)
 
-    def print_MemoryMetadata(self, record, **_):
+    def print_RegionMemoryMetadata(self, record, **_):
         return self._record(
             "memory",
             (
-                ("peak", {item.memory_level: item.peak_bytes for item in record.footprint}),
-                ("persistent", sum(item.persistent_bytes for item in record.footprint), 0),
-                ("advisories", len(record.advisories), 0),
+                ("traffic", self._breakdown(record.traffic.storage, record.topologies)),
+                ("footprint", self._footprint(record.footprint)),
+                (
+                    "peak",
+                    {
+                        item.memory_level: format_bytes(item.peak_bytes)
+                        for item in record.peaks
+                    },
+                ),
+                (
+                    "persistent",
+                    {
+                        item.memory_level: format_bytes(item.persistent_bytes)
+                        for item in record.peaks
+                        if item.persistent_bytes
+                    },
+                ),
             ),
         )
 
-    def print_LoopFootprintMetadata(self, record, **_):
-        footprints = {
-            f"{item.buffer}@{item.memory_level}": PAIR.join(
-                str(value) for value in (item.bytes, item.device_bytes, item.repeated_bytes)
-            )
-            for item in record.footprints
-        }
+    def print_ReuseWindow(self, record, **_):
         return self._record(
-            "loop-footprint",
-            (("footprints", footprints), ("status", "complete" if record.known else "lower-bound")),
+            "",
+            (
+                ("buffer", record.buffer),
+                ("holds", format_bytes(record.holds_bytes)),
+                ("time", record.time or "none"),
+                ("space", record.space or "none"),
+                ("reuse", format_bytes(record.reuse_bytes)),
+                ("fits", "yes" if record.fits else "no"),
+            ),
         )
 
     def print_RooflineMetadata(self, record, **_):
@@ -203,6 +230,7 @@ class CommentPrinter:
                 ("module", record.module, ""),
                 ("function", record.function, ""),
                 ("topology", record.topology, "none"),
+                ("wave", record.wave, ""),
             ),
         )
 
@@ -211,11 +239,11 @@ class CommentPrinter:
             "selection", (("requested", record.requested, ()), ("executed", record.executed, ()))
         )
 
-    def print_MemorySummary(self, record, **_):
-        return self._single("peak-footprint", record.peak_bytes, {})
-
     def print_AdvisorySummary(self, record, **_):
         return self._single("advisory", record.text)
+
+    def print_ErrorSummary(self, record, **_):
+        return self._single("error", record.text)
 
     def print_PerformanceSummaryView(self, record, **_):
         return self._record(
@@ -236,10 +264,6 @@ def render_comment(record, *, opt_in=frozenset()):
     return method(record, opt_in=opt_in) if method else None
 
 
-def peak_footprint(record):
-    return {item.memory_level: item.peak_bytes for item in record.footprint}
-
-
 __all__ = [
     "CommentPrinter",
     "Prose",
@@ -254,8 +278,7 @@ __all__ = [
     "TRIPS",
     "ReportIdentity",
     "ReportSelection",
-    "MemorySummary",
     "AdvisorySummary",
+    "ErrorSummary",
     "PerformanceSummaryView",
-    "peak_footprint",
 ]

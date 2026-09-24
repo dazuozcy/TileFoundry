@@ -27,7 +27,7 @@ from tilefoundry.target.cuda.spec import (
 )
 from tilefoundry.target.facts import (
     TopologyFacts,
-    TopologyLimitFacts,
+    TopologyLevelFacts,
     facts_result,
 )
 from tilefoundry.target.hardware.envelope import HardwareDocument
@@ -135,35 +135,42 @@ class CudaTarget(Target):
         has is stated by whoever constructs the target, and no card can read
         which of them it is.
         """
+        from tilefoundry.target.cuda.facts import parallel_units  # noqa: PLC0415
+
         return TopologyFacts(
             (
-                TopologyLimitFacts("gpu", self.device_count, from_target=True),
-                TopologyLimitFacts("cta", None),
-                TopologyLimitFacts(
-                    "thread", self.architecture.topology_limit("thread")
+                TopologyLevelFacts(
+                    "gpu", self.device_count, parallel_units(self, "gpu"), from_target=True
                 ),
-            )
+                TopologyLevelFacts("cta", None, parallel_units(self, "cta")),
+                TopologyLevelFacts(
+                    "thread",
+                    self.architecture.topology_limit("thread"),
+                    parallel_units(self, "thread"),
+                ),
+            ),
+            parallel_level="cta",
         )
 
     def get_facts(self, facts_type: type, query: object | None = None):
         """Project CUDA hardware through the facts this Target owns."""
         if facts_type is TopologyFacts and query is None:
             return facts_result(self, facts_type, self._topology_facts())
-        if facts_type is TopologyLimitFacts:
-            for level in self._topology_facts().topologies:
-                if level.name == query:
-                    return facts_result(self, facts_type, level)
+        if facts_type is TopologyLevelFacts:
+            level = self._topology_facts().level(
+                query if isinstance(query, str) else None
+            )
+            if level is not None:
+                return facts_result(self, facts_type, level)
             return super().get_facts(facts_type, query)
 
         from tilefoundry.analysis.facts import (  # noqa: PLC0415
             MemoryHierarchyFacts,
-            ParallelCapacityFacts,
             PerformanceServiceFacts,
             ThroughputFacts,
         )
         from tilefoundry.target.cuda.facts import (  # noqa: PLC0415
             memory_hierarchy,
-            parallel_capacity,
             performance_service,
             throughput,
         )
@@ -172,8 +179,6 @@ class CudaTarget(Target):
             return facts_result(self, facts_type, memory_hierarchy(self, query))
         if facts_type is ThroughputFacts:
             return facts_result(self, facts_type, throughput(self, query))
-        if facts_type is ParallelCapacityFacts:
-            return facts_result(self, facts_type, parallel_capacity(self, query))
         if facts_type is PerformanceServiceFacts:
             return facts_result(self, facts_type, performance_service(self, query))
         return super().get_facts(facts_type, query)

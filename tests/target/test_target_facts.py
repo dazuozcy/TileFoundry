@@ -9,7 +9,6 @@ import pytest
 
 from tilefoundry.analysis.facts import (
     MemoryHierarchyFacts,
-    ParallelCapacityFacts,
     ThroughputFacts,
 )
 from tilefoundry.ir.types import DType
@@ -19,7 +18,7 @@ from tilefoundry.target import (
     CudaTarget,
     Target,
     TopologyFacts,
-    TopologyLimitFacts,
+    TopologyLevelFacts,
     UnsupportedCapabilityError,
 )
 from tilefoundry.target.facts import TargetFactsError, facts_result
@@ -68,7 +67,7 @@ def test_two_cuda_products_project_the_hardware_each_one_is() -> None:
     assert throughput.memory_bandwidth_bytes_per_second == 7_672_320_000_000
     assert peaks[DType.f4e2m1] == 9_000_000_000_000_000
     assert DType.f4e2m1 not in dict(hopper.get_facts(ThroughputFacts).peak_flops_per_second)
-    assert blackwell.get_facts(ParallelCapacityFacts).parallel_units == 148
+    assert blackwell.get_facts(TopologyFacts).parallel().max_physical_units == 148
 
 
 def test_a_target_without_a_requested_projection_fails_closed() -> None:
@@ -86,10 +85,14 @@ def test_topology_limits_are_target_facts_and_base_validation_is_inherited() -> 
     cuda = CudaTarget("nvidia.h200_sxm")
     amx = AmxTarget()
 
-    assert cuda.get_facts(TopologyLimitFacts, "cta").max_static_extent is None
-    assert cuda.get_facts(TopologyLimitFacts, "thread").max_static_extent == 1024
-    assert amx.get_facts(TopologyLimitFacts, "core").max_static_extent == 8
-    assert amx.get_facts(TopologyLimitFacts, "amx").max_static_extent == 1
+    cuda_levels = cuda.get_facts(TopologyFacts)
+    amx_levels = amx.get_facts(TopologyFacts)
+    assert cuda_levels.level("cta") == TopologyLevelFacts("cta", None, 132)
+    assert cuda_levels.level("thread").max_logical_units == 1024
+    assert cuda_levels.parallel() == cuda_levels.level("cta")
+    assert amx_levels.level("core") == TopologyLevelFacts("core", 8, 8)
+    assert amx_levels.level("amx") == TopologyLevelFacts("amx", 1, None)
+    assert amx_levels.parallel() == amx_levels.level("core")
     assert cuda.topology_limit("cta") == cuda.device.sm_count == 132
     assert cuda.topology_limit("thread") == cuda.architecture.max_threads_per_cta
 
@@ -99,9 +102,9 @@ def test_topology_limits_are_target_facts_and_base_validation_is_inherited() -> 
 
         def get_facts(self, facts_type: type, query: object | None = None):
             if facts_type is TopologyFacts and query is None:
-                return TopologyFacts((TopologyLimitFacts("unit", 4),))
-            if facts_type is TopologyLimitFacts and query == "unit":
-                return TopologyLimitFacts("unit", 4)
+                return TopologyFacts((TopologyLevelFacts("unit", 4, 2),))
+            if facts_type is TopologyLevelFacts and query == "unit":
+                return TopologyLevelFacts("unit", 4, 2)
             return super().get_facts(facts_type, query)
 
     _DirectTarget().validate_program_topology(Topology("unit", 4))

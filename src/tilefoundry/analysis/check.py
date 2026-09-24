@@ -14,6 +14,7 @@ from tilefoundry.ir.core import (
     BindingMetadata,
     Call,
     Expr,
+    RangeMetadata,
     Var,
 )
 from tilefoundry.ir.core.module import (
@@ -47,18 +48,19 @@ from tilefoundry.ir.types.substitute import (
 )
 from tilefoundry.ir.visitor import BindingSubstitutionCloner, collect_exprs
 from tilefoundry.target import UnsupportedCapabilityError
+from tilefoundry.target.facts import TopologyFacts
 from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
-from tilefoundry.visitor_registry.visitors import inference_type
+from tilefoundry.visitor_registry.typeinfer import inference_type
 
 from .errors import AnalysisError
-from .facts import ParallelCapacityFacts, PerformanceServiceFacts
+from .facts import PerformanceServiceFacts
 from .metadata import (
     ComputeCostMetadata,
     MemoryMetadata,
     PerformanceMetadata,
     PerformanceSummaryMetadata,
+    RegionMemoryMetadata,
     RooflineMetadata,
-    TrafficMetadata,
 )
 
 _INLINE_NODES = 10_000
@@ -67,8 +69,9 @@ _DERIVED_METADATA = {
     MemoryMetadata,
     PerformanceMetadata,
     PerformanceSummaryMetadata,
+    RangeMetadata,
+    RegionMemoryMetadata,
     RooflineMetadata,
-    TrafficMetadata,
 }
 _ResourceKey = tuple[str, str]
 
@@ -122,8 +125,7 @@ class PerformanceChecker:
     def check_target_facts(self, ctx: AnalysisCheckContext) -> None:
         """Require a machine whose stated capacity and rates fit the question."""
         try:
-            capacity = ctx.target.get_facts(ParallelCapacityFacts, ctx.topology_level)
-            services = ctx.target.get_facts(PerformanceServiceFacts, ctx.topology_level)
+            topologies = ctx.target.get_facts(TopologyFacts)
         except UnsupportedCapabilityError as error:
             raise AnalysisError(f"performance: {error}") from None
         if ctx.topology_level is None:
@@ -131,12 +133,17 @@ class PerformanceChecker:
                 "performance: no topology level was selected, so there is no "
                 "unit for a rate to be stated per"
             )
-        if capacity.topology != ctx.topology_level:
+        level = topologies.level(ctx.topology_level)
+        if level is None or level.max_physical_units is None:
             raise AnalysisError(
-                f"performance: selected topology level {ctx.topology_level!r}, but "
-                f"the target's parallel capacity is stated for {capacity.topology!r}"
+                "performance: the target states no physical units for topology "
+                f"level {ctx.topology_level!r}"
             )
-        units = capacity.parallel_units
+        units = level.max_physical_units
+        try:
+            services = ctx.target.get_facts(PerformanceServiceFacts, ctx.topology_level)
+        except UnsupportedCapabilityError as error:
+            raise AnalysisError(f"performance: {error}") from None
         if isinstance(units, bool) or not isinstance(units, int) or units <= 0:
             raise AnalysisError(
                 "performance: the target must publish a positive parallel-unit "
@@ -160,7 +167,7 @@ def _program_dim_vars(module: Module, function: Function) -> dict[str, object]:
     return found
 
 
-def _resolve_program_geometry(
+def resolve_program_geometry(
     module: Module,
     function: Function,
     dims: Mapping[str, int] | None,
@@ -595,7 +602,11 @@ def check_program(
             f"got {budget!r}"
         )
     derived = InlineCloner(module, function, budget).clone()
-    inference_type(derived.body, TypeInferContext(scope=FunctionScope(module, derived)))
+    inference_type(
+        derived,
+        TypeInferContext(scope=FunctionScope(module, derived)),
+        ranges=True,
+    )
     _require_concrete_geometry(module, derived, error_type=AnalysisError)
     target = module.resolve_target()
     for topology in module.effective_topologies():

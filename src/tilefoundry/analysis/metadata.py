@@ -92,38 +92,44 @@ class ComputeCostMetadata(IRMetadata):
 
 
 @dataclass(frozen=True)
-class TrafficMetadata(IRMetadata):
-    """The bytes one occurrence moves, in the two coordinates a move has.
+class Traffic:
+    """The bytes one occurrence or region moves in its two coordinates.
 
     ``storage`` says where the bytes are; ``communication`` says whose boundary
     they crossed, which a storage level cannot answer: data handed from one
     card to another is global memory at both ends and has still gone
     somewhere. One movement is counted in both, because it spends both.
-    ``operands`` is positional against ``(*call.args, call)`` on a Call and
-    empty on a Function, whose totals count each occurrence as often as its
-    loops repeat it.
     """
 
-    topologies: tuple[str, ...] = ()
     storage: Breakdown[TrafficBytes] = Breakdown()
     communication: Breakdown[TrafficBytes] = Breakdown()
-    operands: tuple[TrafficBytes, ...] = ()
-
-    @property
-    def whole(self) -> tuple[tuple[str, TrafficBytes], ...]:
-        return tuple((name, spread.total) for name, spread in self.storage.kinds)
-
-    @property
-    def per_unit(self) -> tuple[tuple[str, TrafficBytes], ...]:
-        return tuple(
-            (name, spread.per_unit[-1] if spread.per_unit else spread.total)
-            for name, spread in self.storage.kinds
-        )
 
 
 @dataclass(frozen=True)
-class MemoryLevelFootprint:
-    """How much of one memory level a function needs at its peak.
+class Footprint:
+    """Unique bytes one wave touches, by source buffer and memory level."""
+
+    buffers: tuple[tuple[str, Breakdown[int]], ...] = ()
+    complete: bool = True
+
+
+@dataclass(frozen=True)
+class MemoryMetadata(IRMetadata):
+    """One Call's memory behavior for one occurrence.
+
+    ``operands`` is positional against ``(*call.args, call)``. ``footprint`` is
+    absent until a read-footprint analysis has actually produced a conclusion.
+    """
+
+    topologies: tuple[str, ...] = ()
+    traffic: Traffic = Traffic()
+    operands: tuple[TrafficBytes, ...] = ()
+    footprint: Footprint | None = None
+
+
+@dataclass(frozen=True)
+class MemoryLevelPeak:
+    """One level's solved high-water mark or largest logical value.
 
     ``persistent_bytes`` is the part that cannot be reclaimed within the
     function, so it is the floor the peak can never fall below.
@@ -135,46 +141,14 @@ class MemoryLevelFootprint:
     capacity_bytes: int | None = None
 
     @property
-    def level(self) -> str:
-        """Compatibility spelling for consumers rendering a memory level."""
-        return self.memory_level
-
-    @property
     def exceeds_capacity(self) -> bool:
         """Whether the peak does not fit the stated capacity."""
         return self.capacity_bytes is not None and self.peak_bytes > self.capacity_bytes
 
 
 @dataclass(frozen=True)
-class BufferFootprint:
-    """Per-position, device-wide, and repeated bytes touched in one buffer."""
-
-    buffer: str
-    memory_level: str
-    bytes: int
-    device_bytes: int
-    repeated_bytes: int
-
-    @property
-    def level(self) -> str:
-        return self.memory_level
-
-
-@dataclass(frozen=True)
-class LoopFootprintMetadata(IRMetadata):
-    """Buffer bytes touched by one authored loop, grouped by storage level.
-
-    ``known`` is false when some access has no representable relation; the
-    retained footprints are then a lower bound over the accesses that are known.
-    """
-
-    footprints: tuple[BufferFootprint, ...]
-    known: bool
-
-
-@dataclass(frozen=True)
 class ValueLifetime:
-    """One value's residency, as positions in the function's definition order.
+    """One value's residency on the function's structured SSA event timeline.
 
     ``persistent`` marks a value that is resident for the whole function rather
     than until its last use. Every parameter is persistent because a function
@@ -191,45 +165,49 @@ class ValueLifetime:
     last_used_at: int
     persistent: bool = False
 
-    @property
-    def level(self) -> str:
-        """Compatibility spelling for consumers rendering a memory level."""
-        return self.memory_level
+
+@dataclass(frozen=True)
+class ReuseWindow:
+    """One buffer's re-reads, and what keeping it costs the cache.
+
+    ``time`` is the loop whose next iteration reads it again and ``space`` the
+    mesh axis whose units read it at once; either may be absent. ``holds`` is
+    everything the wave touches while it must stay resident -- other buffers
+    included, because they are what evicts it -- and ``reuse`` the bytes that
+    are not fetched again once it does.
+    """
+
+    buffer: str
+    time: str = ""
+    space: str = ""
+    holds_bytes: int = 0
+    reuse_bytes: int = 0
+    fits: bool = True
+    complete: bool = True
 
 
 @dataclass(frozen=True)
-class AllocationMetadata:
-    """What showing this function's buffers fit took.
+class RegionMemoryMetadata(IRMetadata):
+    """Record one region's memory behavior against a target hierarchy.
 
-    Where any of them would sit is the solver's business and appears nowhere
-    here. What a reader can act on is whether the question was settled.
+    Today this is attached to a Function, because traffic totals and placement
+    span the whole function. A footprint is absent until one has been computed;
+    no empty record is attached to a LoopRegion merely to reserve the type.
     """
 
     solver_status: str
-
-
-@dataclass(frozen=True)
-class MemoryMetadata(IRMetadata):
-    """Record one function's memory behavior against a target hierarchy.
-
-    Function attachment reflects that peaks span all live ranges. Advisories
-    report cache working-set and order-dependent peak overflow; only a single
-    value exceeding an addressable level is an error because no schedule can
-    place it.
-
-    ``allocation`` is absent when the function has no addressable buffer to
-    place at the level being analysed, which is a different answer from having
-    placed one: nothing was decided, so nothing is claimed.
-    """
-
-    footprint: tuple[MemoryLevelFootprint, ...] = ()
+    topologies: tuple[str, ...] = ()
+    traffic: Traffic = Traffic()
+    footprint: Footprint | None = None
+    reuse_windows: tuple[ReuseWindow, ...] = ()
     lifetimes: tuple[ValueLifetime, ...] = ()
+    peaks: tuple[MemoryLevelPeak, ...] = ()
+    errors: tuple[str, ...] = ()
     advisories: tuple[str, ...] = ()
-    allocation: "AllocationMetadata | None" = None
 
-    def memory_level(self, name: str) -> MemoryLevelFootprint | None:
-        """The footprint recorded for *name*, if the function touches it."""
-        return next((item for item in self.footprint if item.memory_level == name), None)
+    def peak_for(self, name: str) -> MemoryLevelPeak | None:
+        """The peak recorded for *name*, if this region touches it."""
+        return next((item for item in self.peaks if item.memory_level == name), None)
 
 
 @dataclass(frozen=True)
@@ -295,18 +273,19 @@ class PerformanceSummaryMetadata(IRMetadata):
 
 
 __all__ = [
-    "AllocationMetadata",
     "Breakdown",
-    "BufferFootprint",
-    "ComputeCostMetadata",
-    "LoopFootprintMetadata",
-    "MemoryLevelFootprint",
     "MemoryMetadata",
+    "ComputeCostMetadata",
+    "Footprint",
+    "MemoryLevelPeak",
     "PerformanceMetadata",
     "PerformanceSummaryMetadata",
+    "RegionMemoryMetadata",
+    "ReuseWindow",
     "RooflineMetadata",
     "Spread",
     "TimelineMetadata",
+    "Traffic",
     "TrafficBytes",
     "ValueLifetime",
     "breakdown",

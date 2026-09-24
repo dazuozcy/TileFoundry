@@ -45,6 +45,7 @@ from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.pattern import Tensor as TensorPattern
 from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
 from tilefoundry.ir.hir.tensor.slice import Slice as SliceOp
+from tilefoundry.ir.isl_interop import index_set
 from tilefoundry.ir.types import (
     DType,
     TensorType,
@@ -61,7 +62,6 @@ from tilefoundry.visitor_registry.access_relation import (
     AffineAccess,
     BoundaryRelation,
     access_relation_registry,
-    index_set,
     local_relations_of,
     relation_of,
     relations_of,
@@ -245,8 +245,8 @@ def test_a_reached_leaf_is_charged_at_its_own_level_and_the_others_are_not() -> 
     both = measured()
     assert both.operands == (TrafficBytes(), TrafficBytes(read=12), TrafficBytes())
     assert (
-        both.storage.of("gmem").total,
-        both.storage.of("rmem").total,
+        both.traffic.storage.of("gmem").total,
+        both.traffic.storage.of("rmem").total,
     ) == (
         TrafficBytes(read=4),
         TrafficBytes(read=8),
@@ -262,11 +262,11 @@ def test_a_reached_leaf_is_charged_at_its_own_level_and_the_others_are_not() -> 
     assert one.operands == (TrafficBytes(), TrafficBytes(read=8), TrafficBytes()), (
         "the second number is eight bytes wide"
     )
-    assert one.storage.of("rmem").total == TrafficBytes(read=8), (
+    assert one.traffic.storage.of("rmem").total == TrafficBytes(read=8), (
         "and it lives at rmem, so gmem was not touched at all"
     )
-    assert one.storage.of("gmem") is None, "gmem was not touched at all"
-    assert one.storage.of("rmem").per_unit == (TrafficBytes(read=8),), (
+    assert one.traffic.storage.of("gmem") is None, "gmem was not touched at all"
+    assert one.traffic.storage.of("rmem").per_unit == (TrafficBytes(read=8),), (
         "one CTA is the only unit, so its share is the whole"
     )
 
