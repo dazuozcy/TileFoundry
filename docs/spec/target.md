@@ -864,6 +864,28 @@ class AscendTarget(Target):
     at launch, no card can read which of them it is), `cta` one AI Core block
     (`GetBlockIdx()`'s unit, what a launch's `grid_x` counts), `thread` the
     vector-lane level of one core (no SIMT register exists for it).
+  - `get_facts(TopologyFacts).parallel_level` MUST be `"cta"`: one AI Core
+    block is the unit a launch's `grid_x` counts, so it is the level an
+    analysis wave divides over, on the CUDA target's terms.
+  - Each level's `max_physical_units` MUST restate the deployment's unit count
+    at that level: the stated card count for `npu`, cards times AI Core blocks
+    for `cta`, and cards times blocks times the architecture's vector-lane
+    ceiling for `thread`. That ceiling is a program-logical bound the document
+    itself names, not a published hardware width; no other number exists to
+    state.
+  - `get_facts(MemoryHierarchyFacts)` MUST state `gmem` as the device's HBM
+    (owned target-wide), `smem` as the architecture's per-core Unified Buffer
+    (owned by one `cta`), and `rmem` as the per-core register file. No document
+    states a register-file capacity, so `rmem` MUST carry `None` and stay
+    advisory rather than invented. The implicit `l2` MUST carry the device's
+    L2 capacity and MUST cache `gmem`; no other cache level is published.
+  - `get_facts(ThroughputFacts)` MUST state the device document's dense vector
+    peaks per dtype and the HBM bandwidth at `gmem`, each multiplied by the
+    stated card count.
+  - `get_facts(PerformanceServiceFacts, unit)` MUST divide those same peaks
+    among the level's physical units. `unit_ops` MUST stay empty until a
+    document states a per-unit service rate: work the target states no rate for
+    is refused by name, never priced at nothing.
   - Only `npu` MUST set `from_target`: how many cards a deployment names is
     stated by whoever constructs the target, through `device_count`, which MUST
     be a positive int or omitted. `cta` MUST state no static ceiling (the

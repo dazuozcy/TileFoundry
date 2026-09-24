@@ -9,12 +9,14 @@ import pytest
 
 from tilefoundry.analysis.facts import (
     MemoryHierarchyFacts,
+    PerformanceServiceFacts,
     ThroughputFacts,
 )
 from tilefoundry.ir.types import DType
 from tilefoundry.ir.types.shard import Topology
 from tilefoundry.target import (
     AmxTarget,
+    AscendTarget,
     CudaTarget,
     Target,
     TopologyFacts,
@@ -68,6 +70,81 @@ def test_two_cuda_products_project_the_hardware_each_one_is() -> None:
     assert peaks[DType.f4e2m1] == 9_000_000_000_000_000
     assert DType.f4e2m1 not in dict(hopper.get_facts(ThroughputFacts).peak_flops_per_second)
     assert blackwell.get_facts(TopologyFacts).parallel().max_physical_units == 148
+
+
+def test_ascend_target_projects_its_installed_documents() -> None:
+    """The Ascend projections restate the 910B2C documents, gaps included.
+
+    What the documents do not state shows up as honestly absent: no register
+    capacity, and no per-unit service rate, so ``rmem`` stays advisory and
+    ``unit_ops`` stays empty.
+    """
+    ascend = AscendTarget("huawei.ascend910b2c")
+
+    topology = ascend.get_facts(TopologyFacts)
+    assert topology.level("npu") == TopologyLevelFacts("npu", None, 1, from_target=True)
+    assert topology.level("cta") == TopologyLevelFacts("cta", None, 48)
+    assert topology.level("thread").max_logical_units == 1024
+    assert topology.level("thread").max_physical_units == 48 * 1024
+    assert topology.parallel() is topology.level("cta")
+
+    memory = ascend.get_facts(MemoryHierarchyFacts)
+    assert {level.name: level.owner for level in memory.explicit_levels} == {
+        "gmem": "target",
+        "smem": "cta",
+        "rmem": "cta",
+    }
+    assert memory.explicit("gmem").capacity_bytes == ascend.device.hbm_capacity_bytes
+    assert (
+        memory.explicit("smem").capacity_bytes == ascend.architecture.unified_buffer_per_core_bytes
+    )
+    assert memory.explicit("rmem").capacity_bytes is None
+    assert memory.implicit("l2").capacity_bytes == ascend.device.l2_capacity_bytes
+    assert memory.backing_level("l2") == "gmem"
+
+    throughput = ascend.get_facts(ThroughputFacts)
+    peaks = dict(throughput.peak_flops_per_second)
+    assert peaks[DType.f32] == 100_000_000_000_000
+    assert peaks[DType.f16] == 200_000_000_000_000
+    assert throughput.memory_bandwidth_bytes_per_second == 1_600_000_000_000
+    assert throughput.bandwidth_level == "gmem"
+
+    service = ascend.get_facts(PerformanceServiceFacts)
+    assert service.unit == "cta"
+    assert service.unit_flops == (
+        (DType.bf16, 200_000_000_000_000 // 48),
+        (DType.f16, 200_000_000_000_000 // 48),
+        (DType.f32, 100_000_000_000_000 // 48),
+    )
+    assert service.unit_ops == ()
+    assert service.unit_bandwidth == (("gmem", 1_600_000_000_000 // 48),)
+
+
+def test_ascend_device_count_scales_the_deployment_rates() -> None:
+    """A deployment that names its cards divides its peaks over that many."""
+
+    def cards(target: AscendTarget) -> int:
+        return target.device_count or 1
+
+    two_cards = AscendTarget("huawei.ascend910b2c", device_count=2)
+    one_card = AscendTarget("huawei.ascend910b2c")
+
+    assert two_cards.get_facts(TopologyLevelFacts, "npu") == TopologyLevelFacts(
+        "npu", 2, 2, from_target=True
+    )
+    assert two_cards.get_facts(TopologyLevelFacts, "cta").max_physical_units == 2 * 48
+    assert (
+        two_cards.get_facts(ThroughputFacts).memory_bandwidth_bytes_per_second
+        == cards(two_cards) * 1_600_000_000_000
+    )
+    assert two_cards.get_facts(ThroughputFacts).peak_flops_per_second == tuple(
+        (dtype, peak * cards(two_cards))
+        for dtype, peak in one_card.get_facts(ThroughputFacts).peak_flops_per_second
+    )
+    assert (
+        two_cards.get_facts(PerformanceServiceFacts).unit_flops
+        == one_card.get_facts(PerformanceServiceFacts).unit_flops
+    )
 
 
 def test_a_target_without_a_requested_projection_fails_closed() -> None:
