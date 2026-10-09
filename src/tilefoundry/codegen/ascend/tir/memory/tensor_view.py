@@ -11,7 +11,8 @@ needs core/lane offsets the AscendC path does not model yet.
 from __future__ import annotations
 
 from tilefoundry.codegen.ascend.context import AscendCodegenContext
-from tilefoundry.ir.core import Var
+from tilefoundry.ir.core import Call, Var
+from tilefoundry.ir.tir.memory.ptr_of import PtrOf
 from tilefoundry.ir.tir.memory.tensor_view import TensorView
 from tilefoundry.ir.tir.stmts import LetStmt
 from tilefoundry.ir.types.mesh import Mesh
@@ -56,6 +57,8 @@ def _emit(let: LetStmt, ctx: AscendCodegenContext) -> None:
             "yet; only a whole-buffer view over a kernel parameter is"
         )
     source = call.args[0]
+    if isinstance(source, Call) and isinstance(source.target, PtrOf):
+        source = source.args[0]
     if not isinstance(source, Var) or not ctx.is_kernel_param(source):
         raise NotImplementedError(
             "Ascend tensor_view: the memory source must be a kernel parameter; "
