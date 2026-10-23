@@ -38,8 +38,8 @@ ROPE_BASE = 1e6            # Qwen3-1.7B
 WDIR = "/home/tilelang/zuochuanuong/weights/qwen3_1_7b"
 
 # ---------------- kernel launch (verified v2 recipe) ----------------
-assert os.environ.get("ASCEND_RT_VISIBLE_DEVICES") == "0", \
-    "run with ASCEND_RT_VISIBLE_DEVICES=0 (chip 3 has MTE ROB ECC faults)"
+assert os.environ.get("ASCEND_RT_VISIBLE_DEVICES") == "4", \
+    "run with ASCEND_RT_VISIBLE_DEVICES=0 (chip 0~3 has MTE ROB ECC faults)"
 lib = ctypes.CDLL(f"{_HERE}/kernel/libmegak.so")
 lib.run_megak.argtypes = [ctypes.c_void_p] * 36 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
 
@@ -61,6 +61,39 @@ def pack_w(w, npad):
             .permute(2, 0, 1, 3).contiguous().view(-1))
 
 
+def pack_w_chunks(w, nGlobal, npad, slab, nc, nrd, nk):
+    """Chunk-major fractal pack for the pipelined gemv (kernel v3).
+    Layout: [cid][nt][kc][16 k-frac][maxncc n-frac][256] -- one contiguous
+    block per gemv chunk so the kernel streams 32..64KB contiguous reads.
+    Ragged n-tiles are zero-padded to maxncc (Mmad runs the pad width; the
+    fixpipe trims to the real nce columns)."""
+    N, K = w.shape
+    maxncc = nc // 16
+    wp = torch.zeros(npad, K, dtype=torch.bfloat16, device=w.device)
+    wp[:N] = w
+    blocks = (wp.reshape(npad // 16, 16, K // 16, 16)
+               .permute(2, 0, 1, 3).contiguous())          # [kb][nb][16n][16k]
+    KB, FB = blocks.shape[0], blocks.shape[1]
+    flat = blocks.reshape(KB * FB, 256)
+    dev = w.device
+    cid = torch.arange(NB, device=dev).view(-1, 1, 1, 1, 1)
+    nt = torch.arange(nrd, device=dev).view(1, -1, 1, 1, 1)
+    kc = torch.arange(nk, device=dev).view(1, 1, -1, 1, 1)
+    jj = torch.arange(16, device=dev).view(1, 1, 1, -1, 1)
+    ii = torch.arange(maxncc, device=dev).view(1, 1, 1, 1, -1)
+    n0 = cid * slab + nt * nc
+    nlim = torch.clamp(cid * slab + slab, max=nGlobal)
+    nce = torch.clamp(torch.minimum(n0 + nc, nlim) - n0, min=0)
+    ncc = nce // 16
+    n0f = n0 // 16
+    valid = (ii < ncc) & (n0 < nGlobal)
+    src = torch.where(valid, (kc * 16 + jj) * FB + n0f + ii,
+                      torch.full_like(ii + kc + jj, KB * FB))
+    zero = torch.zeros(1, 256, dtype=torch.bfloat16, device=dev)
+    out = torch.cat([flat, zero], dim=0)[src.reshape(-1)]
+    return out.contiguous().view(-1)
+
+
 class Runtime:
     """Device buffers + the single-launch decode step."""
 
@@ -79,11 +112,11 @@ class Runtime:
             for i in range(L)]).contiguous()                    # (L, NGU, H)
         Wd = torch.stack([lay(i, "mlp.down_proj.weight") for i in range(L)]).contiguous()
         Wlm = _w_ts.get("lm_head.weight", _w_ts["model.embed_tokens.weight"])
-        self.WqkvP = torch.cat([pack_w(Wqkv[i], NQKV_PAD) for i in range(L)]).npu()
-        self.WoP = torch.cat([pack_w(Wo[i], NO_PAD) for i in range(L)]).npu()
-        self.WguP = torch.cat([pack_w(Wgu[i], NGU) for i in range(L)]).npu()
-        self.WdP = torch.cat([pack_w(Wd[i], ND_PAD) for i in range(L)]).npu()
-        self.WlmP = pack_w(Wlm, NB * SPAN).npu()
+        self.WqkvP = torch.cat([pack_w_chunks(Wqkv[i], NQKV, NQKV_PAD, 176, 96, 2, H // 256) for i in range(L)]).npu()
+        self.WoP = torch.cat([pack_w_chunks(Wo[i], H, NO_PAD, 96, 96, 1, H // 256) for i in range(L)]).npu()
+        self.WguP = torch.cat([pack_w_chunks(Wgu[i], NGU, NGU, 512, 128, 4, H // 256) for i in range(L)]).npu()
+        self.WdP = torch.cat([pack_w_chunks(Wd[i], H, ND_PAD, 96, 96, 1, II // 256) for i in range(L)]).npu()
+        self.WlmP = pack_w_chunks(Wlm, VV, NB * SPAN, SPAN, 96, SPAN // 96, H // 256).npu()
         self.rms1w = torch.stack([lay(i, "input_layernorm.weight") for i in range(L)]).bfloat16().npu()
         self.rms2w = torch.stack([lay(i, "post_attention_layernorm.weight") for i in range(L)]).bfloat16().npu()
         self.rmsfw = bf(_w_ts["model.norm.weight"]).npu()       # (H,)
@@ -103,7 +136,7 @@ class Runtime:
         self.VcP = torch.zeros(L * KVH, (SPADG // 16) * 8 * 256,
                                dtype=torch.bfloat16, device=DEV).view(-1)
         self.idx_tab = torch.arange(SPANP, dtype=torch.float32, device=DEV)
-        self.syncws = torch.zeros(4096 + 48 * 256 * 16, dtype=torch.int32, device=DEV)
+        self.syncws = torch.zeros(4096 + 48 * 256 * 16 + 24576, dtype=torch.int32, device=DEV)
 
         mk = lambda *s, dt=torch.bfloat16: torch.empty(*s, dtype=dt, device=DEV)
         self.xEmb = mk(H)
@@ -224,7 +257,7 @@ def main():
     ap.add_argument("--prompt", default=None)
     ap.add_argument("--prompt-file", default=None)
     ap.add_argument("--max-new-tokens", type=int, default=64)
-    ap.add_argument("--bench", default=None)
+    ap.add_argument("--bench", default="ctx")
     args = ap.parse_args()
 
     dec = Decoder()

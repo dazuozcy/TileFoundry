@@ -94,9 +94,16 @@ constexpr int NCH = SPAN / CH + 1;    // 4 (last chunk 192 valid)
 constexpr int NTM = STEP / SLT;       // 54 max tiles per slice
 constexpr float EPS = 1e-6f;
 constexpr float NEG_INF = -1e30f;
+// chunk-major weight pack: elements per layer per gemv
+//   = NB * nrd * nk * (16 kfrac * maxncc nfrac * 256)
+constexpr int QKV_LAYER = NB * 2 * (H / KTILE) * 16 * (NC_QKV / 16) * 256;   // 9437184
+constexpr int O_LAYER = NB * 1 * (H / KTILE) * 16 * (NC_O / 16) * 256;       // = NO_PAD*H
+constexpr int GU_LAYER = NB * 4 * (H / KTILE) * 16 * (NC_GU / 16) * 256;     // = NGU*H
+constexpr int D_LAYER = NB * 1 * (II / KTILE) * 16 * (NC_D / 16) * 256;      // = ND_PAD*II
+constexpr int LM_LAYER = NB * NRD_LM * (H / KTILE) * 16 * (NC_LM / 16) * 256;  // = NB*SPAN*H
 
 // seq workspace layout (int32), carved out of p_syncws:
-//   [0, 1536)                SyncAll GM ws (48 x 8)
+//   [0, 1536)                SyncAll GM ws (48 x 8) -- unused in v2
 //   [4096 ...]               rows 0..23 AIV slots, 24..47 AIC slots;
 //                           slot = 16 int32 at SEQ_WANT(row, r)
 //                           = 4096 + (row*256 + r)*16  (max 196608)
@@ -104,11 +111,56 @@ constexpr int SEQ_OFF = 4096;
 constexpr int SEQ_ROUNDS = 256;        // 8*28 + finals headroom
 __aicore__ inline int SEQ_WANT(int cid, int r) { return SEQ_OFF + (cid * 256 + r) * 16; }
 
+// ---- v7 fine-grained producer/consumer progress words (see OPTLOG R6) ----
+// One dedicated seq round per channel.  The producer stores
+//     value = tag + li*PROG_SPAN + count
+// and the consumer tests `>= want`, so a consumer on a COARSE grain (e.g. a
+// 1024-position softmax chunk = 4 score tiles) can proceed the instant that
+// chunk's producer step lands, instead of waiting for the whole stage.  This
+// turns a phase barrier into a streaming hand-off (Mirage-style grain
+// interleave) and is what lets gemm2's PV stream overlap the softmax tail.
+// PROG_SPAN=16 keeps li*PROG_SPAN+count < 512 = the per-launch tag step, so
+// each word stays strictly monotonic across launches: a stale word from a
+// previous token can never satisfy `>= want` (the old count is >512 behind).
+constexpr int PROG_SPAN = 16;          // grains/layer (softmax chunks <= 14)
+constexpr int PR_PROBS = 232;          // round idx: AIV->AIC probs chunks landed
+// (232/233 sit above the per-layer rounds 0..223 and the 224 finals round)
+
+// ---- v2 sentinel gates (replace poll+2xSyncAll; see OPTLOG/README) ----
+// AIC arms a DEAD-ROW word in its own fixpipe region with SENT at layer
+// start, then (after the gate's fixpipes) self-polls it until the data lands
+// (!= SENT), then publishes its seq word at SEQ_WANT(24+cid, r). Consumers
+// poll the seq word(s) -- single word for 1:1 gates, the [c0,c1) range for
+// all-24 gates. No plane SyncAll anywhere.
+constexpr int SENT = 0x7FC00000;       // qNaN bit pattern: never a real f32 GEMV value
+
 // ---------------- cube helpers ----------------
 struct CubeCtx {
     event_t ev0, ev1, ev2, ev3, ev4, ev5;
+    event_t ev6, ev7;              // second MTE2_MTE1 / MTE1_MTE2 (ping-pong parity 1)
     LocalTensor<bfloat16_t> la1, lb1, la2, lb2;
+    LocalTensor<bfloat16_t> la1b, lb1b;   // second L1 buffer set (parity 1)
     LocalTensor<float> lc1;
+    // ---- v5 prefetch ring: static B-side weights streamed during gate waits ----
+    event_t evA;                   // A-pack group load
+    LocalTensor<bfloat16_t> abuf;  // A-pack group staging (8 k-chunks)
+    event_t eM2R[6], eM1R[6];      // ring MTE2_MTE1 / MTE1_MTE2 (distinct channels)
+    LocalTensor<bfloat16_t> ringb[6];
+    int cid;
+    int64_t prodCount, consCount;  // ring cursors (reset per gemv)
+};
+
+// Ring depth (chunks).  v10: 6 x 64KB = 384KB, aliasing the gemm1/gemm2 K/V
+// buffers b1/b1b (idle while a weight gemv runs) so no extra L1 is needed;
+// during a gate wait MTE2 can now keep 6 chunks (384KB) in flight instead of 4.
+constexpr int RN = 6;
+
+// Per-gemv framing (cursors live in CubeCtx so the ring can be filled before
+// the gate opens, then consumed by gemv_ring).
+struct GemvCtx {
+    int nk, nrd, nrdLive, maxncc, nc, slab, nGlobal;
+    int64_t chunkElems, total;
+    int prodNt, prodKc;
 };
 
 // AIC: poll a GM seq word until it equals want (dcci + volatile read).
@@ -118,6 +170,18 @@ __aicore__ inline void poll_seq(volatile __gm__ int32_t* p, int32_t want) {
              cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
         __asm__ __volatile__("" ::: "memory");
     }
+}
+
+// AIC: poll a progress word until it reaches at least `want` (>= test).  Used
+// for the streaming probs hand-off: gemm2 only needs chunk c (4 tiles) to
+// start, not the whole softmax stage.
+__aicore__ inline void aic_wait_prog(volatile __gm__ int32_t* p, int32_t want) {
+    while (*p < want) {
+        dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+             cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+        __asm__ __volatile__("" ::: "memory");
+    }
+    __asm__ __volatile__("" ::: "memory");
 }
 
 // AIC: publish a GM seq word via direct scalar store + dcci (KFC pattern,
@@ -133,57 +197,127 @@ __aicore__ inline void aic_seq(volatile __gm__ int32_t* g, int slot, int32_t val
     __asm__ __volatile__("");
 }
 
-// GEMV over one weight slab set; W packed [kb][nb][16n x 16k] with nb =
-// nPad/16 n-fractals PER K-BLOCK (nPad >= nGlobal, host pads rows to nPad!);
-// xPacked is the 16x broadcast A-fractal pack; out (16, outStride) f32,
-// row 0 valid.
-__aicore__ inline void gemv_slab(CubeCtx& c, GlobalTensor<bfloat16_t> wBase,
-    GlobalTensor<bfloat16_t> xPacked, GlobalTensor<float> outBase,
-    int nGlobal, int kTotal, int nc, int nrd, int slab, int cid, int outStride,
-    int nPad) {
-    const int NF = nPad / 16;
+// AIC: arm a sentinel word in its own fixpipe region (dead row). Done at
+// layer start, long before the fixpipe, so the store lands first.
+__aicore__ inline void aic_arm(volatile __gm__ float* p) {
+    *(volatile __gm__ int32_t*)p = SENT;
+    __asm__ __volatile__("");
+    dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+         cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+    __asm__ __volatile__("" ::: "memory");
+}
+
+// AIC: after the gate's fixpipes, poll the armed word until data (!= SENT)
+// lands in L2. Detection of the actual landing -- replaces the SyncAll delay.
+__aicore__ inline void aic_wait_land(volatile __gm__ float* p) {
+    while (*(volatile __gm__ int32_t*)p == SENT) {
+        dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+             cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+        __asm__ __volatile__("" ::: "memory");
+    }
+}
+
+// Ring push: stream one B chunk into slot (prodCount%RN); wait the slot's
+// MTE1_MTE2 free-flag first if the slot is being recycled.
+__aicore__ inline void ring_push(CubeCtx& c, GlobalTensor<bfloat16_t>& wBase,
+    int64_t chunkOff, int64_t chunkElems) {
+    const int b = (int)(c.prodCount % RN);
+    if (c.prodCount >= RN) { WaitFlag<HardEvent::MTE1_MTE2>(c.eM1R[b]); }
+    DataCopy(c.ringb[b], wBase[chunkOff], chunkElems);
+    SetFlag<HardEvent::MTE2_MTE1>(c.eM2R[b]);
+    c.prodCount++;
+}
+
+// Frame the gemv and reset the ring cursors (previous gemv drained its slots).
+__aicore__ inline void gemv_begin(CubeCtx& c, GemvCtx& s, int nGlobal, int kTotal,
+    int nc, int nrd, int slab) {
+    s.nGlobal = nGlobal; s.nc = nc; s.nrd = nrd; s.slab = slab;
+    s.nk = kTotal / KTILE; s.maxncc = nc / 16;
+    s.chunkElems = (int64_t)(KTILE / 16) * s.maxncc * 256;
+    s.nrdLive = 0;
+    for (int nt = 0; nt < nrd; nt++) { if (c.cid * slab + nt * nc >= nGlobal) break; s.nrdLive++; }
+    s.total = (int64_t)s.nrdLive * s.nk;
+    s.prodNt = 0; s.prodKc = 0;
+    c.prodCount = 0; c.consCount = 0;
+}
+
+// Top the ring up to RN chunks (call before the gate opens and after each
+// consume). Only B is prefetched -- the A-pack is gate-dependent.
+__aicore__ inline void ring_fill(CubeCtx& c, GemvCtx& s, GlobalTensor<bfloat16_t>& wBase) {
+    while (c.prodCount - c.consCount < RN && c.prodCount < s.total) {
+        const int64_t off = ((int64_t)c.cid * s.nrd + s.prodNt) * s.nk + s.prodKc;
+        ring_push(c, wBase, off * s.chunkElems, s.chunkElems);
+        if (++s.prodKc == s.nk) { s.prodKc = 0; s.prodNt++; }
+    }
+}
+
+// GEMV over one weight slab set, consuming the B-side from the prefetch ring.
+// W is CHUNK-MAJOR packed: [layer][cid][nt][kc][16 kfrac][maxncc nfrac][256],
+// ragged tiles zero-padded to maxncc (Mmad runs the pad width; fixpipe trims
+// to nce). xPacked is the 16x broadcast A-fractal pack; out (16, outStride)
+// f32, row 0 valid.
+//
+// v5: the static B-side stream is decoupled from the gate. The caller runs
+// gemv_begin()+ring_fill() BEFORE its gate poll, so MTE2 streams the weights
+// while the AIC would otherwise spin. gemv_ring then consumes the ring and
+// tops it up inline. The A-pack (same for all nt) is staged in L1 in groups of
+// 8 k-chunks; a group is loaded at gate-open and later groups reloaded at
+// their boundary (nk>8 only: the down gemv).
+//
+// Events: A-group uses channel 5; ring slots use distinct channels 1..4 for
+// both MTE2_MTE1 (landed) and MTE1_MTE2 (free). The ring's leftover free-flags
+// are drained at exit so the next gemv starts clean.
+__aicore__ inline void gemv_ring(CubeCtx& c, GemvCtx& s, GlobalTensor<bfloat16_t> wBase,
+    GlobalTensor<bfloat16_t> xPacked, GlobalTensor<float> outBase, int outStride, int outSlab) {
     const int KCC = KTILE / 16;
-    bool l1Busy = false, l0Busy = false, l0cBusy = false;
-    for (int nt = 0; nt < nrd; nt++) {
-        const int n0 = cid * slab + nt * nc;
-        if (n0 >= nGlobal) break;
-        const int nlim = (cid * slab + slab < nGlobal) ? (cid * slab + slab) : nGlobal;
-        const int ncEnd = (n0 + nc < nlim) ? (n0 + nc) : nlim;
+    const int nk = s.nk;
+    const int maxncc = s.maxncc;
+    // A-pack group 0 (chunks 0..7) staged up-front (after the gate has opened)
+    DataCopy(c.abuf, xPacked, 8 * 16 * KTILE);
+    SetFlag<HardEvent::MTE2_MTE1>(c.evA);
+    WaitFlag<HardEvent::MTE2_MTE1>(c.evA);
+    bool l0cBusy = false;
+    for (int nt = 0; nt < s.nrdLive; nt++) {
+        const int n0 = c.cid * s.slab + nt * s.nc;
+        const int nlim = (c.cid * s.slab + s.slab < s.nGlobal) ? (c.cid * s.slab + s.slab) : s.nGlobal;
+        const int ncEnd = (n0 + s.nc < nlim) ? (n0 + s.nc) : nlim;
         const int nce = ncEnd - n0;
-        const int ncc = nce / 16;
-        for (int k0 = 0; k0 < kTotal; k0 += KTILE) {
+        bool l0Busy = false;
+        for (int i = 0; i < nk; i++) {
+            if ((i & 7) == 0 && i > 0) {            // next A group (down: 3 groups)
+                DataCopy(c.abuf, xPacked[(int64_t)i * (16 * KTILE)], 8 * 16 * KTILE);
+                SetFlag<HardEvent::MTE2_MTE1>(c.evA);
+                WaitFlag<HardEvent::MTE2_MTE1>(c.evA);
+            }
+            const int b = (int)(c.consCount % RN);
+            WaitFlag<HardEvent::MTE2_MTE1>(c.eM2R[b]);                 // B chunk landed
             if (l0cBusy) { WaitFlag<HardEvent::FIX_M>(c.ev4); l0cBusy = false; }
             if (l0Busy)  { WaitFlag<HardEvent::M_MTE1>(c.ev3); l0Busy = false; }
-            if (l1Busy)  { WaitFlag<HardEvent::MTE1_MTE2>(c.ev5); l1Busy = false; }
-            DataCopy(c.la1, xPacked[k0 * 16], 16 * KTILE);
-            for (int jj = 0; jj < KCC; jj++) {
-                const int j = k0 / 16 + jj;
-                DataCopy(c.lb1[jj * ncc * 256], wBase[(int64_t)(j * NF + n0 / 16) * 256], ncc * 256);
-            }
-            SetFlag<HardEvent::MTE2_MTE1>(c.ev0);
-            WaitFlag<HardEvent::MTE2_MTE1>(c.ev0);
             LoadData2DParams pa(0, (uint8_t)KCC, 1, 0, 0, false, 0);
-            LoadData(c.la2, c.la1, pa);
-            LoadData2DParams pb(0, (uint8_t)(KCC * ncc), 1, 0, 0, false, 0);
-            LoadData(c.lb2, c.lb1, pb);
-            SetFlag<HardEvent::MTE1_M>(c.ev1);
-            WaitFlag<HardEvent::MTE1_M>(c.ev1);
-            MmadParams mp; mp.m = 16; mp.n = nce; mp.k = KTILE; mp.cmatrixInitVal = (k0 == 0);
+            LoadData(c.la2, c.abuf[(i & 7) * (16 * KTILE)], pa);
+            LoadData2DParams pb(0, (uint8_t)(KCC * maxncc), 1, 0, 0, false, 0);
+            LoadData(c.lb2, c.ringb[b], pb);
+            SetFlag<HardEvent::MTE1_MTE2>(c.eM1R[b]);                  // ring slot free
+            SetFlag<HardEvent::MTE1_M>(c.ev1); WaitFlag<HardEvent::MTE1_M>(c.ev1);
+            MmadParams mp; mp.m = 16; mp.n = maxncc * 16; mp.k = KTILE; mp.cmatrixInitVal = (i == 0);
             Mmad(c.lc1, c.la2, c.lb2, mp);
             SetFlag<HardEvent::M_MTE1>(c.ev3);
-            SetFlag<HardEvent::MTE1_MTE2>(c.ev5);
-            l0Busy = true; l1Busy = true;
+            l0Busy = true;
+            c.consCount++;
+            ring_fill(c, s, wBase);                 // top the ring up
         }
+        if (l0Busy)  { WaitFlag<HardEvent::M_MTE1>(c.ev3); l0Busy = false; }
         SetFlag<HardEvent::M_FIX>(c.ev2); WaitFlag<HardEvent::M_FIX>(c.ev2);
-        FixpipeParamsV220 fp; fp.nSize = nce; fp.mSize = 16; fp.srcStride = 16; fp.dstStride = outStride;
-        Fixpipe(outBase[n0], c.lc1, fp);
-        SetFlag<HardEvent::FIX_MTE2>(c.ev0); WaitFlag<HardEvent::FIX_MTE2>(c.ev0);
+        FixpipeParamsV220 fp; fp.nSize = nce; fp.mSize = 2; fp.srcStride = 16; fp.dstStride = outStride;
+        Fixpipe(outBase[(int64_t)c.cid * outSlab + nt * s.nc], c.lc1, fp);
         SetFlag<HardEvent::FIX_M>(c.ev4);
         l0cBusy = true;
     }
-    if (l0Busy)  { WaitFlag<HardEvent::M_MTE1>(c.ev3); }
-    if (l1Busy)  { WaitFlag<HardEvent::MTE1_MTE2>(c.ev5); }
     if (l0cBusy) { WaitFlag<HardEvent::FIX_M>(c.ev4); }
+    // drain the ring's leftover slot-free flags (one per used slot; none when
+    // this slab is empty, e.g. AICs 22/23 for o/down)
+    const int used = (s.total < RN) ? (int)s.total : RN;
+    for (int b = 0; b < used; b++) { WaitFlag<HardEvent::MTE1_MTE2>(c.eM1R[b]); }
 }
 
 // ---------------- AIV helpers ----------------
@@ -291,6 +425,99 @@ __aicore__ inline void seq_write(GlobalTensor<int32_t>& g, int32_t slot, int32_t
     SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
 }
 
+// AIV: poll the AIC seq words (SEQ_WANT(24+c, r), far apart so the aic_seq
+// store+dcci of different AICs never share a cache line) until ALL words in
+// [c0,c1) equal want. v3: sweep split into (a) N independent volatile reads
+// issued back-to-back -- their L2 latencies overlap in the memory pipeline
+// (the old interleaved read+dcci serialized at ~200ns x N = ~5us per sweep,
+// which the timeline showed as the gate detect latency), (b) dcci only for
+// the words that missed. All words are re-read after any miss.
+__aicore__ inline void aic_gate_poll(volatile __gm__ int32_t* gseqp, int r, int32_t want,
+    int c0, int c1) {
+    for (;;) {
+        int32_t v[24];
+        for (int c = c0; c < c1; c++) {
+            v[c] = *(gseqp + SEQ_WANT(24 + c, r));
+        }
+        bool ok = true;
+        for (int c = c0; c < c1; c++) {
+            if (v[c] != want) {
+                volatile __gm__ int32_t* p = gseqp + SEQ_WANT(24 + c, r);
+                dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+                     cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+                ok = false;
+            }
+        }
+        if (ok) break;
+        __asm__ __volatile__("" ::: "memory");
+    }
+    __asm__ __volatile__("" ::: "memory");
+}
+
+// AIV: poll ONE AIC seq word (1:1 gates).
+__aicore__ inline void aic_gate_poll1(volatile __gm__ int32_t* gseqp, int r, int cid,
+    int32_t want) {
+    volatile __gm__ int32_t* p = gseqp + SEQ_WANT(24 + cid, r);
+    while (*p != want) {
+        dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+             cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+        __asm__ __volatile__("" ::: "memory");
+    }
+}
+
+// ---- v8 AIV-side L2 warmer (see OPTLOG R7) -------------------------------
+// The AIV plane is ~97% MTE2-idle (msprof: `aiv_mte2_ratio` 3%), while the AIC
+// plane is stalled ~34us/layer waiting on AIV stages.  During one of those
+// windows -- the all-AIV wait for the 22 AIC "o" words -- the AIVs have an
+// independent MTE2 and nothing to do, so they stream the gu gemv's weight slab
+// (the very next bulk read) into L2 and discard it.  gu then reads from L2 and
+// its HBM time drops.  Unlike the rejected R6c (same trick from the AIC, which
+// self-blocked on its own MTE2 queue), this uses a *different* core's MTE2.
+constexpr int WARM_SLOT = 8192;         // bf16 elements per UB scratch slot (16KB)
+// Poll AIC words [c0,c1) for `want` and warm [off0,off1) of g meanwhile.
+// `pending` comes back as the number of outstanding SetFlags for warm_drain.
+__aicore__ inline void aiv_warm_gate(volatile __gm__ int32_t* gseqp, int r,
+    int32_t want, int c0, int c1, GlobalTensor<bfloat16_t> g,
+    int64_t off0, int64_t off1, LocalTensor<bfloat16_t> s0,
+    LocalTensor<bfloat16_t> s1, int& pending) {
+    const event_t e0 = (event_t)6, e1 = (event_t)7;   // unused MTE2_V ids
+    int64_t off = off0;
+    int issued = 0;
+    for (;;) {
+        int32_t v[24];
+        for (int c = c0; c < c1; c++) { v[c] = *(gseqp + SEQ_WANT(24 + c, r)); }
+        bool ok = true;
+        for (int c = c0; c < c1; c++) {
+            if (v[c] != want) {
+                volatile __gm__ int32_t* p = gseqp + SEQ_WANT(24 + c, r);
+                dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+                     cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+                ok = false;
+            }
+        }
+        if (ok) break;
+        if (off + WARM_SLOT <= off1) {
+            const int par = issued & 1;
+            if (issued >= 2) { WaitFlag<HardEvent::MTE2_V>(par ? e1 : e0); }
+            DataCopy(par ? s1 : s0, g[off], WARM_SLOT);
+            SetFlag<HardEvent::MTE2_V>(par ? e1 : e0);
+            off += WARM_SLOT;
+            issued++;
+        }
+        __asm__ __volatile__("" ::: "memory");
+    }
+    pending = issued < 2 ? issued : 2;
+}
+// Drain the warmer's outstanding SetFlags. MUST be called before the scratch
+// (pw/tPw) or the ids 6/7 are reused -- i.e. before the next layer's pass 1
+// writes pw, and before kernel exit (a pending flag at exit hangs the core).
+__aicore__ inline void aiv_warm_drain(int pending) {
+    const event_t e0 = (event_t)6, e1 = (event_t)7;
+    for (int k = 0; k < pending; k++) {
+        WaitFlag<HardEvent::MTE2_V>((((pending - 1 - k) & 1) ? e1 : e0));
+    }
+}
+
 // ---------------- kernel ----------------
 __global__ __aicore__ void megak(
     GM_ADDR p_ffts, GM_ADDR p_WqkvP, GM_ADDR p_WoP, GM_ADDR p_WguP, GM_ADDR p_WdP,
@@ -319,9 +546,19 @@ __global__ __aicore__ void megak(
 
         TPipe pipe;
         TBuf<TPosition::A1> a1; TBuf<TPosition::B1> b1;
+        TBuf<TPosition::A1> a1b; TBuf<TPosition::B1> b1b;
+        TBuf<TPosition::A1> ab1;                     // A-pack group staging
+        TBuf<TPosition::B1> rb0, rb1, rb2, rb3;      // prefetch ring (B chunks)
         TBuf<TPosition::A2> a2; TBuf<TPosition::B2> b2; TBuf<TPosition::CO1> c1;
         pipe.InitBuffer(a1, 16 * KTILE * sizeof(bfloat16_t));
         pipe.InitBuffer(b1, 64 * 1024);
+        pipe.InitBuffer(a1b, 16 * KTILE * sizeof(bfloat16_t));
+        pipe.InitBuffer(b1b, 64 * 1024);
+        pipe.InitBuffer(ab1, 8 * 16 * KTILE * sizeof(bfloat16_t));
+        pipe.InitBuffer(rb0, 64 * 1024);
+        pipe.InitBuffer(rb1, 64 * 1024);
+        pipe.InitBuffer(rb2, 64 * 1024);
+        pipe.InitBuffer(rb3, 64 * 1024);
         pipe.InitBuffer(a2, 16 * KTILE * sizeof(bfloat16_t));
         pipe.InitBuffer(b2, 64 * 1024);
         pipe.InitBuffer(c1, 16 * 256 * sizeof(float));
@@ -338,8 +575,26 @@ __global__ __aicore__ void megak(
         C.ev5 = static_cast<event_t>(pipe.FetchEventID<HardEvent::MTE1_MTE2>());
         pipe.FetchEventID<HardEvent::FIX_M>();
         C.ev4 = static_cast<event_t>(pipe.FetchEventID<HardEvent::FIX_M>());
+        C.ev6 = static_cast<event_t>(pipe.FetchEventID<HardEvent::MTE2_MTE1>());
+        C.ev7 = static_cast<event_t>(pipe.FetchEventID<HardEvent::MTE1_MTE2>());
+        // v5 ring: FetchEventID only PEEKS (always 0), so the 4 slot channels
+        // are hardcoded (distinct ids 1..4 verified on dav-2201).
+        C.eM2R[0] = (event_t)1; C.eM2R[1] = (event_t)2;
+        C.eM2R[2] = (event_t)3; C.eM2R[3] = (event_t)4;
+        C.eM2R[4] = (event_t)6; C.eM2R[5] = (event_t)7;
+        C.eM1R[0] = (event_t)1; C.eM1R[1] = (event_t)2;
+        C.eM1R[2] = (event_t)3; C.eM1R[3] = (event_t)4;
+        C.eM1R[4] = (event_t)6; C.eM1R[5] = (event_t)7;
+        C.evA = (event_t)5;
+        C.cid = cid; C.prodCount = 0; C.consCount = 0;
+        C.abuf = ab1.Get<bfloat16_t>();
+        C.ringb[0] = rb0.Get<bfloat16_t>(); C.ringb[1] = rb1.Get<bfloat16_t>();
+        C.ringb[2] = rb2.Get<bfloat16_t>(); C.ringb[3] = rb3.Get<bfloat16_t>();
         C.la1 = a1.Get<bfloat16_t>();
         C.lb1 = b1.Get<bfloat16_t>();
+        C.la1b = a1b.Get<bfloat16_t>();
+        C.lb1b = b1b.Get<bfloat16_t>();
+        C.ringb[4] = C.lb1; C.ringb[5] = C.lb1b;   // alias gemm1/2 buffers
         C.la2 = a2.Get<bfloat16_t>();
         C.lb2 = b2.Get<bfloat16_t>();
         C.lc1 = c1.Get<float>();
@@ -380,170 +635,251 @@ __global__ __aicore__ void megak(
         tguOut.SetGlobalBuffer(ggu_out);    tdOut.SetGlobalBuffer(gd_out);
         tLogits.SetGlobalBuffer(glogits);
 
+        volatile __gm__ float* gqkvF = (volatile __gm__ float*)gqkv_out;
+        volatile __gm__ float* gscoresF = (volatile __gm__ float*)gscores;
+        volatile __gm__ float* gpartAccF = (volatile __gm__ float*)gpartAccP;
+        volatile __gm__ float* goF = (volatile __gm__ float*)go_out;
+        volatile __gm__ float* gguF = (volatile __gm__ float*)ggu_out;
+        volatile __gm__ float* gdF = (volatile __gm__ float*)gd_out;
+        volatile __gm__ float* glogitsF = (volatile __gm__ float*)glogits;
+        // sentinel column helpers (last-landed word of this AIC's region)
+        const int qkvSC = ((cid + 1) * 176 < NQKV ? (cid + 1) * 176 : NQKV) - 1;
+        const int odSC = ((cid + 1) * 96 < H ? (cid + 1) * 96 : H) - 1;
+        const int guSC = cid * 512 + 511;
+        const int lmSC = (cid < 23) ? (65 * NC_LM + 95) : (64 * NC_LM + 63);
+        const bool odActive = (cid * 96 < H);   // AICs 22,23 skip o/d gemv
+        // lm sentinel armed once per launch (logits region is host-prefilled)
+        aic_arm(glogitsF + cid * SPANP + lmSC);
+
         for (int li = 0; li < lstop; li++) {
             const int R = li * 8;
-            // ---- qkv gemv (after own aiv wrote xn1P) ----
-            poll_seq(gseq + SEQ_WANT(cid, R + 0), tag + R + 0);      // rms1 done
-            {
-                GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWqkv + (int64_t)li * NQKV_PAD * H);
-                gemv_slab(C, tw, txn1P, tqkvOut, NQKV, H, NC_QKV, 2, 176, cid, NQKV_PAD,
-                          NQKV_PAD);
+            // ---- arm this layer's sentinel words (dead rows of the fixpipe
+            // regions). Dead rows are never read by AIVs, so arming is safe
+            // regardless of how far the AIVs still are in layer li-1. The
+            // previous layer's fixpipe for each region is confirmed landed
+            // (this AIC self-polled it) before we re-arm. ----
+            const int sr = 1;                  // dead row 1 (weight gemvs write mSize=2)
+            const int sr2 = 2;                 // dead row 2 (scores/PV write mSize=3)
+            aic_arm(gqkvF + sr * NQKV_PAD + qkvSC);
+            if (sblk > 0) {
+                aic_arm(gscoresF + (int64_t)(cid * 16 + sr2) * STEP + s0 + (nloc - 1) * SLT + (SLT - 1));
+                aic_arm(gpartAccF + ((kv * NSL + sid) * 16 + sr2) * D + (D - 1));
             }
-            aic_seq(gseq, SEQ_WANT(24 + cid, R + 0), tag + R + 0);   // qkv done
+            if (odActive) {
+                aic_arm(goF + sr * NO_PAD + odSC);
+                aic_arm(gdF + sr * ND_PAD + odSC);
+            }
+            aic_arm(gguF + sr * NGU + guSC);
+            // ---- qkv gemv (after own aiv wrote xn1P) ----
+            {
+                GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWqkv + (int64_t)li * QKV_LAYER);
+                GemvCtx sq; gemv_begin(C, sq, NQKV, H, NC_QKV, 2, 176);
+                ring_fill(C, sq, tw);                            // prefetch during wait
+                poll_seq(gseq + SEQ_WANT(cid, R + 0), tag + R + 0);      // rms1 done
+                gemv_ring(C, sq, tw, txn1P, tqkvOut, NQKV_PAD, 176);
+            }
+            aic_wait_land(gqkvF + sr * NQKV_PAD + qkvSC);
+            aic_seq(gseq, SEQ_WANT(24 + cid, R + 0), tag + R + 0);            // qkv done
 
             {
-                // ---- gemm1: scores per 256-tile (guarded busy-flag pattern,
-                // exactly like gemv_slab: one k-chunk per output tile) ----
+                // ---- gemm1: scores per 256-tile (MTE2-pipelined across
+                // tiles: issue tile t+1 before waiting on t) ----
                 poll_seq(gseq + SEQ_WANT(cid, R + 2), tag + R + 2);  // appends done
                 if (sblk > 0) {
                     const int64_t khead = (int64_t)(li * KVH + kv) * 8 * (SPADG / 16) * 256;
                     const int i0 = s0 / 16;
-                    bool l1Busy = false, l0Busy = false, l0cBusy = false;
+                    {
+                        // prologue: tile 0 into parity-0 buffers
+                        DataCopy(C.la1, tq2P[(int64_t)cid * 8 * 256], 8 * 256);
+                        DataCopy(C.lb1, tKcP[khead + (int64_t)(i0 / 16) * 32768], 32768);
+                        SetFlag<HardEvent::MTE2_MTE1>(C.ev0);
+                    }
+                    bool l0Busy = false, l0cBusy = false;
                     for (int t = 0; t < nloc; t++) {
+                        if (t + 1 < nloc) {      // prefetch tile t+1
+                            const int p2 = (t + 1) & 1;
+                            if (t >= 1) { WaitFlag<HardEvent::MTE1_MTE2>(p2 ? C.ev7 : C.ev5); }
+                            LocalTensor<bfloat16_t> a1p = p2 ? C.la1b : C.la1;
+                            LocalTensor<bfloat16_t> b1p = p2 ? C.lb1b : C.lb1;
+                            DataCopy(a1p, tq2P[(int64_t)cid * 8 * 256], 8 * 256);
+                            DataCopy(b1p, tKcP[khead + (int64_t)(i0 / 16 + (t + 1)) * 32768], 32768);
+                            SetFlag<HardEvent::MTE2_MTE1>(p2 ? C.ev6 : C.ev0);
+                        }
+                        WaitFlag<HardEvent::MTE2_MTE1>((t & 1) ? C.ev6 : C.ev0);
                         if (l0cBusy) { WaitFlag<HardEvent::FIX_M>(C.ev4); l0cBusy = false; }
                         if (l0Busy)  { WaitFlag<HardEvent::M_MTE1>(C.ev3); l0Busy = false; }
-                        if (l1Busy)  { WaitFlag<HardEvent::MTE1_MTE2>(C.ev5); l1Busy = false; }
-                        DataCopy(C.la1, tq2P[(int64_t)cid * 8 * 256], 8 * 256);
-                        for (int j = 0; j < 8; j++) {
-                            DataCopy(C.lb1[j * 16 * 256],
-                                     tKcP[khead + (int64_t)j * (SPADG / 16) * 256 +
-                                          (int64_t)(i0 + t * 16) * 256],
-                                     16 * 256);
-                        }
-                        SetFlag<HardEvent::MTE2_MTE1>(C.ev0); WaitFlag<HardEvent::MTE2_MTE1>(C.ev0);
+                        LocalTensor<bfloat16_t> a1p = (t & 1) ? C.la1b : C.la1;
+                        LocalTensor<bfloat16_t> b1p = (t & 1) ? C.lb1b : C.lb1;
                         LoadData2DParams pa(0, 8, 1, 0, 0, false, 0);
-                        LoadData(C.la2, C.la1, pa);
+                        LoadData(C.la2, a1p, pa);
                         LoadData2DParams pb(0, 128, 1, 0, 0, false, 0);
-                        LoadData(C.lb2, C.lb1, pb);
+                        LoadData(C.lb2, b1p, pb);
+                        SetFlag<HardEvent::MTE1_MTE2>((t & 1) ? C.ev7 : C.ev5);
                         SetFlag<HardEvent::MTE1_M>(C.ev1); WaitFlag<HardEvent::MTE1_M>(C.ev1);
                         MmadParams mp; mp.m = 16; mp.n = 256; mp.k = D; mp.cmatrixInitVal = true;
                         Mmad(C.lc1, C.la2, C.lb2, mp);
                         SetFlag<HardEvent::M_MTE1>(C.ev3);
-                        SetFlag<HardEvent::MTE1_MTE2>(C.ev5);
-                        l0Busy = true; l1Busy = true;
+                        l0Busy = true;
                         SetFlag<HardEvent::M_FIX>(C.ev2); WaitFlag<HardEvent::M_FIX>(C.ev2);
-                        FixpipeParamsV220 fp; fp.nSize = 256; fp.mSize = 16; fp.srcStride = 16;
+                        FixpipeParamsV220 fp; fp.nSize = 256; fp.mSize = 3; fp.srcStride = 16;
                         fp.dstStride = STEP;
                         Fixpipe(tScores[((int64_t)cid * 16) * STEP + (int64_t)(s0 + t * SLT)],
                                 C.lc1, fp);
-                        SetFlag<HardEvent::FIX_MTE2>(C.ev0); WaitFlag<HardEvent::FIX_MTE2>(C.ev0);
                         SetFlag<HardEvent::FIX_M>(C.ev4);
                         l0cBusy = true;
                     }
+                    if (nloc >= 2) { WaitFlag<HardEvent::MTE1_MTE2>(((nloc - 2) & 1) ? C.ev7 : C.ev5); }
+                    WaitFlag<HardEvent::MTE1_MTE2>(((nloc - 1) & 1) ? C.ev7 : C.ev5);
                     if (l0Busy)  { WaitFlag<HardEvent::M_MTE1>(C.ev3); }
-                    if (l1Busy)  { WaitFlag<HardEvent::MTE1_MTE2>(C.ev5); }
                     if (l0cBusy) { WaitFlag<HardEvent::FIX_M>(C.ev4); }
                 }
+                if (sblk > 0) { aic_wait_land(gscoresF + (int64_t)(cid * 16 + sr2) * STEP + s0 + (nloc - 1) * SLT + (SLT - 1)); }
                 aic_seq(gseq, SEQ_WANT(24 + cid, R + 2), tag + R + 2);  // scores done
                 // ---- gemm2: PV per tile (accumulates across tiles into ONE
-                // CO1, single Fixpipe; guarded busy flags) ----
+                // CO1, single Fixpipe; MTE2-pipelined across tiles) ----
                 if (sblk > 0) {
-                    poll_seq(gseq + SEQ_WANT(cid, R + 3), tag + R + 3);  // probs done
+                    // v7 streaming hand-off: gemm2 starts as soon as softmax
+                    // chunk 0 (4 tiles) lands and consumes each further chunk
+                    // the instant it is published, so the PV stream overlaps
+                    // the softmax tail instead of waiting for the whole stage.
                     const int64_t vhead = (int64_t)(li * KVH + kv) * (SPADG / 16) * 8 * 256;
                     const int i0 = s0 / 16;
-                    bool l1Busy = false, l0Busy = false;
+                    const int32_t pbase = tag + li * PROG_SPAN;
+                    {
+                        // prologue: tile 0 into parity-0 buffers (chunk 0 ready).
+                        aic_wait_prog(gseq + SEQ_WANT(cid, PR_PROBS), pbase + 1);
+                        DataCopy(C.la1, tprobs2P[((int64_t)cid * NTM + 0) * 16 * 256], 16 * 256);
+                        // V layout is [s-blk][d-blk][16d x 16s]; a 256-tile is 16
+                        // consecutive s-blocks => ONE contiguous 32768-el copy
+                        // (was 16 x 4KB -- dominated the AIC's MTE2 instruction
+                        // count with instruction-bound tiny copies).
+                        DataCopy(C.lb1, tVcP[vhead + (int64_t)i0 * 8 * 256], 32768);
+                        SetFlag<HardEvent::MTE2_MTE1>(C.ev0);
+                    }
+                    bool l0Busy = false;
                     for (int t = 0; t < nloc; t++) {
-                        if (l0Busy) { WaitFlag<HardEvent::M_MTE1>(C.ev3); l0Busy = false; }
-                        if (l1Busy) { WaitFlag<HardEvent::MTE1_MTE2>(C.ev5); l1Busy = false; }
-                        DataCopy(C.la1, tprobs2P[((int64_t)cid * NTM + t) * 16 * 256], 16 * 256);
-                        for (int i = 0; i < 16; i++) {
-                            DataCopy(C.lb1[i * 8 * 256],
-                                     tVcP[vhead + (int64_t)(i0 + t * 16 + i) * 8 * 256],
-                                     8 * 256);
+                        if (t + 1 < nloc) {      // prefetch tile t+1
+                            const int p2 = (t + 1) & 1;
+                            if (t >= 1) { WaitFlag<HardEvent::MTE1_MTE2>(p2 ? C.ev7 : C.ev5); }
+                            LocalTensor<bfloat16_t> a1p = p2 ? C.la1b : C.la1;
+                            LocalTensor<bfloat16_t> b1p = p2 ? C.lb1b : C.lb1;
+                            // V first (no probs dependency), then wait for only
+                            // the chunk that owns tile t+1 before its probs copy.
+                            DataCopy(b1p, tVcP[vhead + (int64_t)(i0 + (t + 1) * 16) * 8 * 256], 32768);
+                            aic_wait_prog(gseq + SEQ_WANT(cid, PR_PROBS), pbase + (t + 1) / 4 + 1);
+                            DataCopy(a1p, tprobs2P[((int64_t)cid * NTM + t + 1) * 16 * 256], 16 * 256);
+                            SetFlag<HardEvent::MTE2_MTE1>(p2 ? C.ev6 : C.ev0);
                         }
-                        SetFlag<HardEvent::MTE2_MTE1>(C.ev0); WaitFlag<HardEvent::MTE2_MTE1>(C.ev0);
+                        WaitFlag<HardEvent::MTE2_MTE1>((t & 1) ? C.ev6 : C.ev0);
+                        if (l0Busy) { WaitFlag<HardEvent::M_MTE1>(C.ev3); l0Busy = false; }
+                        LocalTensor<bfloat16_t> a1p = (t & 1) ? C.la1b : C.la1;
+                        LocalTensor<bfloat16_t> b1p = (t & 1) ? C.lb1b : C.lb1;
                         LoadData2DParams pa(0, 16, 1, 0, 0, false, 0);
-                        LoadData(C.la2, C.la1, pa);
+                        LoadData(C.la2, a1p, pa);
                         LoadData2DParams pb(0, 128, 1, 0, 0, false, 0);
-                        LoadData(C.lb2, C.lb1, pb);
+                        LoadData(C.lb2, b1p, pb);
+                        SetFlag<HardEvent::MTE1_MTE2>((t & 1) ? C.ev7 : C.ev5);
                         SetFlag<HardEvent::MTE1_M>(C.ev1); WaitFlag<HardEvent::MTE1_M>(C.ev1);
                         MmadParams mp; mp.m = 16; mp.n = D; mp.k = SLT; mp.cmatrixInitVal = (t == 0);
                         Mmad(C.lc1, C.la2, C.lb2, mp);
                         SetFlag<HardEvent::M_MTE1>(C.ev3);
-                        SetFlag<HardEvent::MTE1_MTE2>(C.ev5);
-                        l0Busy = true; l1Busy = true;
+                        l0Busy = true;
                     }
+                    if (nloc >= 2) { WaitFlag<HardEvent::MTE1_MTE2>(((nloc - 2) & 1) ? C.ev7 : C.ev5); }
+                    WaitFlag<HardEvent::MTE1_MTE2>(((nloc - 1) & 1) ? C.ev7 : C.ev5);
                     if (l0Busy) { WaitFlag<HardEvent::M_MTE1>(C.ev3); }
-                    if (l1Busy) { WaitFlag<HardEvent::MTE1_MTE2>(C.ev5); }
                     SetFlag<HardEvent::M_FIX>(C.ev2); WaitFlag<HardEvent::M_FIX>(C.ev2);
-                    FixpipeParamsV220 fp; fp.nSize = D; fp.mSize = 16; fp.srcStride = 16;
+                    FixpipeParamsV220 fp; fp.nSize = D; fp.mSize = 3; fp.srcStride = 16;
                     fp.dstStride = D;
                     Fixpipe(tPartAcc[((int64_t)(kv * NSL + sid) * 16) * D], C.lc1, fp);
-                    SetFlag<HardEvent::FIX_MTE2>(C.ev0); WaitFlag<HardEvent::FIX_MTE2>(C.ev0);
                     SetFlag<HardEvent::FIX_M>(C.ev4);
                     WaitFlag<HardEvent::FIX_M>(C.ev4);
                 }
+                if (sblk > 0) { aic_wait_land(gpartAccF + ((kv * NSL + sid) * 16 + sr2) * D + (D - 1)); }
                 aic_seq(gseq, SEQ_WANT(24 + cid, R + 4), tag + R + 4);  // partials done
-                poll_seq(gseq + SEQ_WANT(cid, R + 5), tag + R + 5);     // B_ATT go
             }
             // ---- o gemv ----
             {
-                GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWo + (int64_t)li * NO_PAD * H);
-                gemv_slab(C, tw, tattnP, toOut, H, H, NC_O, 1, 96, cid, NO_PAD, NO_PAD);
+                GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWo + (int64_t)li * O_LAYER);
+                GemvCtx so; gemv_begin(C, so, H, H, NC_O, 1, 96);
+                ring_fill(C, so, tw);        // prefetch Wo during the B_ATT wait
+                // B_ATT go: poll all 8 leader words with one overlapped
+                // sweep (independent reads, dcci only on miss)
+                {
+                    int32_t want5 = tag + R + 5;
+                    for (;;) {
+                        int32_t v[8];
+                        for (int c = 0; c < 8; c++) {
+                            v[c] = *(gseq + SEQ_WANT(c, R + 5));
+                        }
+                        bool ok = true;
+                        for (int c = 0; c < 8; c++) {
+                            if (v[c] != want5) {
+                                volatile __gm__ int32_t* p = gseq + SEQ_WANT(c, R + 5);
+                                dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+                                     cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+                                ok = false;
+                            }
+                        }
+                        if (ok) break;
+                        __asm__ __volatile__("" ::: "memory");
+                    }
+                }
+                gemv_ring(C, so, tw, tattnP, toOut, NO_PAD, 96);
             }
+            if (odActive) { aic_wait_land(goF + sr * NO_PAD + odSC); }
             aic_seq(gseq, SEQ_WANT(24 + cid, R + 5), tag + R + 5);      // o done
             // ---- gate_up gemv ----
-            poll_seq(gseq + SEQ_WANT(cid, R + 6), tag + R + 6);      // xn2 done
             {
-                GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWgu + (int64_t)li * NGU * H);
-                gemv_slab(C, tw, txn2P, tguOut, NGU, H, NC_GU, 4, 512, cid, NGU, NGU);
+                GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWgu + (int64_t)li * GU_LAYER);
+                GemvCtx s; gemv_begin(C, s, NGU, H, NC_GU, 4, 512);
+                ring_fill(C, s, tw);
+                poll_seq(gseq + SEQ_WANT(cid, R + 6), tag + R + 6);      // xn2 done
+                gemv_ring(C, s, tw, txn2P, tguOut, NGU, 512);
             }
+            aic_wait_land(gguF + sr * NGU + guSC);
             aic_seq(gseq, SEQ_WANT(24 + cid, R + 6), tag + R + 6);      // gu done
             // ---- down gemv ----
-            poll_seq(gseq + SEQ_WANT(cid, R + 7), tag + R + 7);      // h done
+            // h is sharded: AIV c wrote hP chunk c; this AIC needs ALL of
+            // hP -> poll all 24 AIV h-done words (overlapped sweep).
             {
-                GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWd + (int64_t)li * ND_PAD * II);
-                gemv_slab(C, tw, thP, tdOut, H, II, NC_D, 1, 96, cid, ND_PAD, ND_PAD);
+                GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWd + (int64_t)li * D_LAYER);
+                GemvCtx s; gemv_begin(C, s, H, II, NC_D, 1, 96);
+                ring_fill(C, s, tw);
+                const int32_t want7 = tag + R + 7;
+                for (;;) {
+                    int32_t v[24];
+                    for (int cc = 0; cc < 24; cc++) {
+                        v[cc] = *(gseq + SEQ_WANT(cc, R + 7));
+                    }
+                    bool ok = true;
+                    for (int cc = 0; cc < 24; cc++) {
+                        if (v[cc] != want7) {
+                            volatile __gm__ int32_t* p = gseq + SEQ_WANT(cc, R + 7);
+                            dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+                                 cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+                            ok = false;
+                        }
+                    }
+                    if (ok) break;
+                    __asm__ __volatile__("" ::: "memory");
+                }
+                gemv_ring(C, s, tw, thP, tdOut, ND_PAD, 96);
             }
+            if (odActive) { aic_wait_land(gdF + sr * ND_PAD + odSC); }
             aic_seq(gseq, SEQ_WANT(24 + cid, R + 7), tag + R + 7);      // down done
         }
 
         // ---- final: lm gemv + logits ----
         {
+            GemvCtx s; gemv_begin(C, s, VV, H, NC_LM, NRD_LM, SPAN);
+            ring_fill(C, s, tWlm);
             poll_seq(gseq + SEQ_WANT(cid, 224), tag + 224);          // rmsf done
-            for (int nt = 0; nt < NRD_LM; nt++) {
-                const int n0 = cid * SPAN + nt * NC_LM;
-                if (n0 >= VV) break;
-                const int nlim = (cid * SPAN + SPAN < VV) ? (cid * SPAN + SPAN) : VV;
-                const int ncEnd = (n0 + NC_LM < nlim) ? (n0 + NC_LM) : nlim;
-                const int nce = ncEnd - n0;
-                const int ncc = nce / 16;
-                bool l1Busy = false, l0Busy = false, l0cBusy = false;
-                for (int k0 = 0; k0 < H; k0 += KTILE) {
-                    if (l0cBusy) { WaitFlag<HardEvent::FIX_M>(C.ev4); l0cBusy = false; }
-                    if (l0Busy)  { WaitFlag<HardEvent::M_MTE1>(C.ev3); l0Busy = false; }
-                    if (l1Busy)  { WaitFlag<HardEvent::MTE1_MTE2>(C.ev5); l1Busy = false; }
-                    DataCopy(C.la1, txnfP[k0 * 16], 16 * KTILE);
-                    for (int jj = 0; jj < KTILE / 16; jj++) {
-                        const int j = k0 / 16 + jj;
-                        DataCopy(C.lb1[jj * ncc * 256],
-                                 tWlm[(int64_t)(j * (NB * SPAN / 16) + n0 / 16) * 256], ncc * 256);
-                    }
-                    SetFlag<HardEvent::MTE2_MTE1>(C.ev0); WaitFlag<HardEvent::MTE2_MTE1>(C.ev0);
-                    LoadData2DParams pa(0, (uint8_t)(KTILE / 16), 1, 0, 0, false, 0);
-                    LoadData(C.la2, C.la1, pa);
-                    LoadData2DParams pb(0, (uint8_t)((KTILE / 16) * ncc), 1, 0, 0, false, 0);
-                    LoadData(C.lb2, C.lb1, pb);
-                    SetFlag<HardEvent::MTE1_M>(C.ev1); WaitFlag<HardEvent::MTE1_M>(C.ev1);
-                    MmadParams mp; mp.m = 16; mp.n = nce; mp.k = KTILE; mp.cmatrixInitVal = (k0 == 0);
-                    Mmad(C.lc1, C.la2, C.lb2, mp);
-                    SetFlag<HardEvent::M_MTE1>(C.ev3);
-                    SetFlag<HardEvent::MTE1_MTE2>(C.ev5);
-                    l0Busy = true; l1Busy = true;
-                }
-                SetFlag<HardEvent::M_FIX>(C.ev2); WaitFlag<HardEvent::M_FIX>(C.ev2);
-                FixpipeParamsV220 fp; fp.nSize = nce; fp.mSize = 16; fp.srcStride = 16;
-                fp.dstStride = NB * SPANP;   // ROW stride of logits (16, NB*SPANP)!
-                Fixpipe(tLogits[(int64_t)cid * SPANP + nt * NC_LM], C.lc1, fp);
-                SetFlag<HardEvent::FIX_MTE2>(C.ev0); WaitFlag<HardEvent::FIX_MTE2>(C.ev0);
-                SetFlag<HardEvent::FIX_M>(C.ev4);
-                l0cBusy = true;
-                if (l0Busy)  { WaitFlag<HardEvent::M_MTE1>(C.ev3); }
-                if (l1Busy)  { WaitFlag<HardEvent::MTE1_MTE2>(C.ev5); }
-                l0cBusy = false;
-                WaitFlag<HardEvent::FIX_M>(C.ev4);
-            }
-            aic_seq(gseq, SEQ_WANT(24 + cid, 224), tag + 224);         // logits done
+            // lm head as a pipelined slab gemv; weights packed to NB*SPAN,
+            // output spans padded to SPANP per cid (outSlab > slab).
+            gemv_ring(C, s, tWlm, txnfP, tLogits, NB * SPANP, SPANP);
+            aic_wait_land(glogitsF + cid * SPANP + lmSC);
+            aic_seq(gseq, SEQ_WANT(24 + cid, 224), tag + 224);            // logits done
         }
     } else {
         // ================= VECTOR SIDE =================
@@ -556,12 +892,17 @@ __global__ __aicore__ void megak(
         const int e0 = (sl + 1 < s0 + thirds) ? (sl + 1) : (s0 + thirds);
         const int sblk = (e0 > s0) ? (e0 - s0) : 0;
         const int nloc = (sblk + SLT - 1) / SLT;
+        // slice 1/2 live lengths (leaders poll those slices' AICs only if live)
+        const int e1 = (sl + 1 < 2 * thirds) ? (sl + 1) : (2 * thirds);
+        const int sblk1 = (e1 > thirds) ? (e1 - thirds) : 0;
+        const int e2 = (sl + 1 < 3 * thirds) ? (sl + 1) : (3 * thirds);
+        const int sblk2 = (e2 > 2 * thirds) ? (e2 - 2 * thirds) : 0;
         const int sidOwner = (sl / thirds < NSL) ? (sl / thirds) : (NSL - 1);
         const bool leader = (sid == 0);
 
         TPipe pipe;
         TBuf<TPosition::VECCALC> tXm, tXf, tXn, tPack, tQkv, tHead, tHb, tSm, tP2, tQ2,
-            tCmb, tAm, tSig, tSync, tFr, tSq;
+            tCmb, tAm, tSig, tSync, tFr, tSq, tW, tHbw, tPw;
         pipe.InitBuffer(tXm, H * sizeof(bfloat16_t));            // residual carrier
         pipe.InitBuffer(tXf, 2 * H * sizeof(float));             // f32 H (val + sq)
         pipe.InitBuffer(tXn, H * sizeof(bfloat16_t));            // bf16 H out
@@ -576,8 +917,12 @@ __global__ __aicore__ void megak(
         pipe.InitBuffer(tAm, 4 * 2048 * sizeof(float));          // argmax
         pipe.InitBuffer(tSig, 8192);                             // sigmoid tmp
         pipe.InitBuffer(tSync, 8 * 48 * sizeof(int32_t));        // SyncAll ub ws
-        pipe.InitBuffer(tFr, 256 * sizeof(bfloat16_t));          // V append RMW
+        pipe.InitBuffer(tFr, 8 * 256 * sizeof(bfloat16_t));      // V append RMW (batched)
         pipe.InitBuffer(tSq, 2 * 16 * sizeof(int32_t));          // seq word (x2)
+        // wide softmax: CW positions at once (CW/SLT tiles), packed output
+        pipe.InitBuffer(tW, 2 * 1024 * sizeof(float));           // w0,w1 f32 row chunks
+        pipe.InitBuffer(tHbw, 2048 * sizeof(bfloat16_t));        // wide exp bf16 (2 heads)
+        pipe.InitBuffer(tPw, (1024 / 256) * 16 * 256 * sizeof(bfloat16_t));  // packed prob tiles
         LocalTensor<bfloat16_t> xm = tXm.Get<bfloat16_t>();
         LocalTensor<float> xf = tXf.Get<float>();
         LocalTensor<float> xs = tXf.Get<float>()[H];
@@ -595,6 +940,11 @@ __global__ __aicore__ void megak(
         LocalTensor<int32_t> syncub = tSync.Get<int32_t>();
         LocalTensor<bfloat16_t> vfr = tFr.Get<bfloat16_t>();
         LocalTensor<int32_t> sq = tSq.Get<int32_t>();
+        LocalTensor<float> ws = tW.Get<float>();
+        LocalTensor<float> w0 = ws[0], w1 = ws[1024];
+        LocalTensor<bfloat16_t> hbw = tHbw.Get<bfloat16_t>();
+        LocalTensor<bfloat16_t> pw = tPw.Get<bfloat16_t>();
+        LocalTensor<float> pwf = tPw.Get<float>();   // pass-1 wide scratch (idle in pass 2)
 
         // named scratch views
         LocalTensor<float> q0f = hd[0], q1f = hd[128], kf = hd[256];
@@ -654,6 +1004,8 @@ __global__ __aicore__ void megak(
             tLogits, tIdxTab, tPartMax, tPartIdx, tCosT, tSinT;
         GlobalTensor<bfloat16_t> tEmb;
         GlobalTensor<int32_t> gsync, gseq;
+        GlobalTensor<bfloat16_t> tWguA;              // v8: gu weights (L2 warmer)
+        tWguA.SetGlobalBuffer((__gm__ bfloat16_t*)p_WguP);
         tKcP.SetGlobalBuffer(gKcP);   tVcP.SetGlobalBuffer(gVcP);
         txn1P.SetGlobalBuffer(gxn1P); tq2P.SetGlobalBuffer(gq2P);
         tprobs2P.SetGlobalBuffer(gprobs2P); tattnP.SetGlobalBuffer(gattnP);
@@ -690,11 +1042,18 @@ __global__ __aicore__ void megak(
             }
             if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 0), tag + R + 0, sq, sqWhich ^= 1, eV3, eM3V); }
 
-            // ---- stage 2: qkv gate (poll 1 assigned AIC slot + plane
-            // SyncAll: after the barrier ALL 24 AIC gemvs are confirmed) ----
-            poll_seq(gseqp + SEQ_WANT(24 + (bid % 24), R + 0), tag + R + 0);
-            SyncAll<false>(gsync, syncub, 48);
-                SyncAll<false>(gsync, syncub, 48);
+            // ---- stage 2: qkv gate. This AIV reads only its own head's
+            // q/k/v output columns, which come from a few AIC slabs -- poll
+            // only those AICs so we decouple from the slowest of all 24
+            // (removes the cross-block qkv land-skew from the critical path).
+            {
+                const int qc0 = kv * 256;                 // q head 2kv,2kv+1 cols
+                const int kc0 = NQKV / 2 + kv * D;
+                const int vc0 = 3 * NQKV / 4 + kv * D;
+                aic_gate_poll(gseqp, R + 0, tag + R + 0, qc0 / 176, (qc0 + 255) / 176 + 1);
+                aic_gate_poll(gseqp, R + 0, tag + R + 0, kc0 / 176, (kc0 + D - 1) / 176 + 1);
+                aic_gate_poll(gseqp, R + 0, tag + R + 0, vc0 / 176, (vc0 + D - 1) / 176 + 1);
+            }
 
             // ---- stage 3: qk-norm, rope, appends, q2P ----
             {
@@ -739,21 +1098,23 @@ __global__ __aicore__ void megak(
                         const int64_t vbase = (int64_t)(li * KVH + kv) * (SPADG / 16) * 8 * 256;
                         PipeBarrier<PIPE_V>();               // vb reads below
                         for (int j = 0; j < 8; j++) {
-                            DataCopy(tKcP[kbase + (int64_t)j * (SPADG / 16) * 256 +
-                                          (int64_t)iBlk * 256 + iRow * 16],
+                            DataCopy(tKcP[kbase + (int64_t)(iBlk / 16) * 32768 +
+                                          (int64_t)j * 4096 + (int64_t)(iBlk % 16) * 256 + iRow * 16],
                                      kb[j * 16], 16);
                         }
+                        // V append: one 4KB RMW over all 8 d-blocks
+                        // (replaces 8 serialized per-block RMWs, v3)
+                        DataCopy(vfr, tVcP[vbase + (int64_t)iBlk * 8 * 256], 8 * 256);
+                        SetFlag<HardEvent::MTE2_S>(eM2S); WaitFlag<HardEvent::MTE2_S>(eM2S);
                         for (int j = 0; j < 8; j++) {
-                            DataCopy(vfr, tVcP[vbase + (int64_t)iBlk * 8 * 256 + j * 256], 256);
-                            SetFlag<HardEvent::MTE2_S>(eM2S); WaitFlag<HardEvent::MTE2_S>(eM2S);
                             for (int n = 0; n < 16; n++) {
-                                vfr.SetValue(n * 16 + iRow, vb.GetValue(j * 16 + n));
+                                vfr.SetValue(j * 256 + n * 16 + iRow, vb.GetValue(j * 16 + n));
                             }
-                            event_t esApp = static_cast<event_t>(s3cnt++ & 3);  // one-shot ids
-                            SetFlag<HardEvent::S_MTE3>(esApp); WaitFlag<HardEvent::S_MTE3>(esApp);
-                            DataCopy(tVcP[vbase + (int64_t)iBlk * 8 * 256 + j * 256], vfr, 256);
-                            SetFlag<HardEvent::MTE3_MTE2>(eM3M2); WaitFlag<HardEvent::MTE3_MTE2>(eM3M2);
                         }
+                        event_t esApp = static_cast<event_t>(s3cnt++ & 3);  // one-shot ids
+                        SetFlag<HardEvent::S_MTE3>(esApp); WaitFlag<HardEvent::S_MTE3>(esApp);
+                        DataCopy(tVcP[vbase + (int64_t)iBlk * 8 * 256], vfr, 8 * 256);
+                        SetFlag<HardEvent::MTE3_MTE2>(eM3M2); WaitFlag<HardEvent::MTE3_MTE2>(eM3M2);
                     }
                 }
             }
@@ -761,65 +1122,121 @@ __global__ __aicore__ void megak(
 
             {
                 // ---- stage 4: two-pass softmax -> probs2P, part_m/l ----
-                // (full gate: poll + SyncAll -- fixpipe output needs the
-                // barrier delay to land in L2; a bare poll is NOT enough,
-                // verified by probe p15vis)
-                poll_seq(gseqp + SEQ_WANT(24 + (bid % 24), R + 2), tag + R + 2);
-                SyncAll<false>(gsync, syncub, 48);
-                SyncAll<false>(gsync, syncub, 48);
+                // (1:1 gate: this AIV reads only its own AIC's score rows)
+                if (sblk > 0) { aic_gate_poll1(gseqp, R + 2, cid, tag + R + 2); }
                 float m0 = NEG_INF, m1 = NEG_INF, l0 = 0.0f, l1 = 0.0f;
                 const float scale = 0.08838834764831845f;  // 1/sqrt(128)
                 if (sblk > 0) {
-                    for (int t = 0; t < nloc; t++) {       // pass 1: max
-                        const int tail = sblk - t * SLT;
-                        LocalTensor<float> s0v = (t & 1) ? sc0b : sc0;
-                        LocalTensor<float> s1v = (t & 1) ? sc1b : sc1;
-                        DataCopy(s0v, tScores[((int64_t)cid * 16) * STEP + (int64_t)(s0 + t * SLT)], 256);
-                        DataCopy(s1v, tScores[((int64_t)cid * 16 + 1) * STEP + (int64_t)(s0 + t * SLT)], 256);
-                        SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
-                        Muls(s0v, s0v, scale, 256);
-                        Muls(s1v, s1v, scale, 256);
-                        if (tail >= 256) {
-                            float tm = tree_max(s0v, 256); if (tm > m0) m0 = tm;
-                            tm = tree_max(s1v, 256); if (tm > m1) m1 = tm;
+                    // v6: process CW=1024 positions per iteration (4 tiles) to
+                    // collapse the per-tile MTE2 latency and batch the probs2P
+                    // write; the tail (sblk%CW) falls back to the 256 loop.
+                    const int64_t sbase0 = ((int64_t)cid * 16) * STEP + s0;
+                    const int64_t sbase1 = ((int64_t)cid * 16 + 1) * STEP + s0;
+                    // pass 1 at PW=4096 (16 tiles) using the idle probs-pack
+                    // scratch (pw is only used in pass 2): 14 load/reduce
+                    // round-trips -> 4, cutting the pass-1 latency the gemm2
+                    // stream waits on.  tree_max destroys the buffer (unused).
+                    for (int c = 0; c < sblk; c += 4096) {          // pass 1: max
+                        const int cl = (c + 4096 <= sblk) ? 4096 : (sblk - c);
+                        if (cl == 4096) {
+                            DataCopy(pwf[0], tScores[sbase0 + c], 4096);
+                            DataCopy(pwf[4096], tScores[sbase1 + c], 4096);
+                            SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
+                            Muls(pwf[0], pwf[0], scale, 4096);
+                            Muls(pwf[4096], pwf[4096], scale, 4096);
+                            float tm = tree_max(pwf[0], 4096); if (tm > m0) m0 = tm;
+                            tm = tree_max(pwf[4096], 4096); if (tm > m1) m1 = tm;
                         } else {
-                            PipeBarrier<PIPE_V>();
-                            for (int i = 0; i < tail; i++) {
-                                float x = s0v.GetValue(i); if (x > m0) m0 = x;
-                                x = s1v.GetValue(i); if (x > m1) m1 = x;
+                            for (int d = 0; d < cl; d += SLT) {
+                                const int tail = cl - d;
+                                DataCopy(sc0, tScores[sbase0 + c + d], SLT);
+                                DataCopy(sc1, tScores[sbase1 + c + d], SLT);
+                                SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
+                                Muls(sc0, sc0, scale, SLT);
+                                Muls(sc1, sc1, scale, SLT);
+                                if (tail >= SLT) {
+                                    float tm = tree_max(sc0, SLT); if (tm > m0) m0 = tm;
+                                    tm = tree_max(sc1, SLT); if (tm > m1) m1 = tm;
+                                } else {
+                                    PipeBarrier<PIPE_V>();
+                                    for (int i = 0; i < tail; i++) {
+                                        float x = sc0.GetValue(i); if (x > m0) m0 = x;
+                                        x = sc1.GetValue(i); if (x > m1) m1 = x;
+                                    }
+                                }
                             }
                         }
                     }
-                    for (int t = 0; t < nloc; t++) {       // pass 2: exp/probs/l
-                        const int tail = sblk - t * SLT;
-                        LocalTensor<float> s0v = (t & 1) ? sc0b : sc0;
-                        LocalTensor<float> s1v = (t & 1) ? sc1b : sc1;
-                        DataCopy(s0v, tScores[((int64_t)cid * 16) * STEP + (int64_t)(s0 + t * SLT)], 256);
-                        DataCopy(s1v, tScores[((int64_t)cid * 16 + 1) * STEP + (int64_t)(s0 + t * SLT)], 256);
-                        SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
-                        Muls(s0v, s0v, scale, 256);
-                        Muls(s1v, s1v, scale, 256);
-                        Adds(s0v, s0v, -m0, 256);
-                        Adds(s1v, s1v, -m1, 256);
-                        Exp(ex0, s0v, 256);
-                        Exp(ex1, s1v, 256);
-                        // land probs BEFORE tree_sum (it destroys ex0 in place!)
-                        Cast(hb[0], ex0, RoundMode::CAST_RINT, 256);    // head0 bf16
-                        Cast(hb[256], ex1, RoundMode::CAST_RINT, 256);  // head1 bf16
-                        if (tail >= 256) {
-                            l0 += tree_sum(ex0, 256);
-                            l1 += tree_sum(ex1, 256);
+                    for (int c = 0; c < sblk; c += 1024) {          // pass 2: exp/probs/l
+                        const int cl = (c + 1024 <= sblk) ? 1024 : (sblk - c);
+                        if (cl == 1024) {
+                            DataCopy(w0, tScores[sbase0 + c], 1024);
+                            DataCopy(w1, tScores[sbase1 + c], 1024);
+                            SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
+                            Muls(w0, w0, scale, 1024);
+                            Muls(w1, w1, scale, 1024);
+                            Adds(w0, w0, -m0, 1024);
+                            Adds(w1, w1, -m1, 1024);
+                            Exp(w0, w0, 1024);
+                            Exp(w1, w1, 1024);
+                            // land probs BEFORE tree_sum (it destroys in place!)
+                            Cast(hbw[0], w0, RoundMode::CAST_RINT, 1024);      // head0 bf16
+                            l0 += tree_sum(w0, 1024);
+                            Cast(hbw[1024], w1, RoundMode::CAST_RINT, 1024);   // head1 bf16
+                            l1 += tree_sum(w1, 1024);
+                            if (sub == 0) {
+                                for (int q = 0; q < 4; q++) {
+                                    strided_rows(pw[q * 4096], hbw[q * 256], 16, 0);
+                                    strided_rows(pw[q * 4096], hbw[1024 + q * 256], 16, 1);
+                                }
+                                SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
+                                DataCopy(tprobs2P[((int64_t)cid * NTM + c / SLT) * 16 * 256], pw, 16 * 1024);
+                                SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
+                                // v7: publish this 1024-chunk (4 tiles).  The
+                                // seq MTE3 is ordered after the probs MTE3, so
+                                // gemm2 sees the progress word only once the
+                                // chunk is actually in GM.
+                                seq_write(gseq, SEQ_WANT(cid, PR_PROBS),
+                                          tag + li * PROG_SPAN + c / 1024 + 1,
+                                          sq, sqWhich ^= 1, eV3, eM3V);
+                            }
                         } else {
-                            PipeBarrier<PIPE_V>();
-                            for (int i = 0; i < tail; i++) { l0 += ex0.GetValue(i); }
-                            for (int i = 0; i < tail; i++) { l1 += ex1.GetValue(i); }
-                        }
-                        if (sub == 0) {
-                            strided_rows(p2, hb[0], 16, 0);
-                            strided_rows(p2, hb[256], 16, 1);
-                            SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
-                            DataCopy(tprobs2P[((int64_t)cid * NTM + t) * 16 * 256], p2, 16 * 256);
-                            SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
+                            for (int d = 0; d < cl; d += SLT) {
+                                const int tail = cl - d;
+                                DataCopy(sc0, tScores[sbase0 + c + d], SLT);
+                                DataCopy(sc1, tScores[sbase1 + c + d], SLT);
+                                SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
+                                Muls(sc0, sc0, scale, SLT);
+                                Muls(sc1, sc1, scale, SLT);
+                                Adds(sc0, sc0, -m0, SLT);
+                                Adds(sc1, sc1, -m1, SLT);
+                                Exp(ex0, sc0, SLT);
+                                Exp(ex1, sc1, SLT);
+                                Cast(hb[0], ex0, RoundMode::CAST_RINT, SLT);
+                                Cast(hb[256], ex1, RoundMode::CAST_RINT, SLT);
+                                if (tail >= SLT) {
+                                    l0 += tree_sum(ex0, SLT);
+                                    l1 += tree_sum(ex1, SLT);
+                                } else {
+                                    PipeBarrier<PIPE_V>();
+                                    for (int i = 0; i < tail; i++) { l0 += ex0.GetValue(i); }
+                                    for (int i = 0; i < tail; i++) { l1 += ex1.GetValue(i); }
+                                }
+                                if (sub == 0) {
+                                    strided_rows(p2, hb[0], 16, 0);
+                                    strided_rows(p2, hb[256], 16, 1);
+                                    SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
+                                    DataCopy(tprobs2P[((int64_t)cid * NTM + (c + d) / SLT) * 16 * 256], p2, 16 * 256);
+                                    SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
+                                }
+                            }
+                            // v7: tail chunk fully written -> publish its index
+                            // (the whole <=1024 tail is one chunk).
+                            if (sub == 0) {
+                                seq_write(gseq, SEQ_WANT(cid, PR_PROBS),
+                                          tag + li * PROG_SPAN + c / 1024 + 1,
+                                          sq, sqWhich ^= 1, eV3, eM3V);
+                            }
                         }
                     }
                 }
@@ -831,14 +1248,18 @@ __global__ __aicore__ void megak(
                 }
                 if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 3), tag + R + 3, sq, sqWhich ^= 1, eV3, eM3V); }
 
-                // ---- stage 5: combine (full gate: poll + SyncAll, then
-                // leaders read part_m/l/partAcc -- the partAcc fixpipe
-                // output needs the barrier delay; part_m/l are AIV-written
-                // and MTE3-ordered behind the R+3 polls transitively) ----
-                poll_seq(gseqp + SEQ_WANT(24 + (bid % 24), R + 4), tag + R + 4);
-                SyncAll<false>(gsync, syncub, 48);
-                SyncAll<false>(gsync, syncub, 48);
+                // ---- stage 5: combine. Leaders gate on: (a) all 3 producer
+                // groups' R+3 seqs -- covers part_m/l (AIV-written, MTE3,
+                // ordered behind each group's own R+3 write) even for DEAD
+                // slices; (b) live slices' AIC ASEQ(R+4) -- partAcc fixpipe
+                // visibility (confirmed by each AIC's own sentinel wait). ----
                 if (sub == 0 && leader) {
+                    poll_seq(gseqp + SEQ_WANT(kv, R + 3), tag + R + 3);
+                    poll_seq(gseqp + SEQ_WANT(kv + 8, R + 3), tag + R + 3);
+                    poll_seq(gseqp + SEQ_WANT(kv + 16, R + 3), tag + R + 3);
+                    aic_gate_poll1(gseqp, R + 4, kv, tag + R + 4);
+                    if (sblk1 > 0) { aic_gate_poll1(gseqp, R + 4, kv + 8, tag + R + 4); }
+                    if (sblk2 > 0) { aic_gate_poll1(gseqp, R + 4, kv + 16, tag + R + 4); }
                     // combine heads 2kv, 2kv+1 over 3 slice partials
                     DataCopy(pml, tPartM[(int64_t)(kv * 2) * NSL * 16], 6 * 16);
                     SetFlag<HardEvent::MTE2_S>(eM2S); WaitFlag<HardEvent::MTE2_S>(eM2S);
@@ -879,16 +1300,22 @@ __global__ __aicore__ void megak(
                     SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
                     DataCopy(tattnP[(int64_t)(kv * 2 * D) * 16], pack, 4096);
                     SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
+                    // B_ATT go: leaders only; AICs poll all 8 leader words
+                    seq_write(gseq, SEQ_WANT(cid, R + 5), tag + R + 5, sq, sqWhich ^= 1, eV3, eM3V);
                 }
-                SyncAll<false>(gsync, syncub, 48);
-                if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 5), tag + R + 5, sq, sqWhich ^= 1, eV3, eM3V); }
             }
 
             // ---- stage 6: resid1 + rms2 -> xn2P ----
+            int wpend = 0;
             {
-                poll_seq(gseqp + SEQ_WANT(24 + (bid % 24), R + 5), tag + R + 5);  // o done
-                SyncAll<false>(gsync, syncub, 48);
-                SyncAll<false>(gsync, syncub, 48);
+                // v8: while waiting for all 22 AIC "o" words, warm the paired
+                // AIC's gu weight slab (chunks 4..31; 0..3 are the AIC's ring)
+                // into L2.  Each sub takes half, so both MTE2 engines work.
+                const int64_t gub = (int64_t)li * GU_LAYER + (int64_t)cid * (32 * 32768);
+                aiv_warm_gate(gseqp, R + 5, tag + R + 5, 0, 22, tWguA,
+                              gub + (int64_t)(sub ? 18 : 4) * 32768,
+                              gub + (int64_t)(sub ? 32 : 18) * 32768,
+                              pw, pw[WARM_SLOT], wpend);
                 DataCopy(xf, toOut, H);                      // o row 0 (f32)
                 SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
                 Cast(xs, xm, RoundMode::CAST_NONE, H);
@@ -904,38 +1331,36 @@ __global__ __aicore__ void megak(
                 if (sub == 0) { pack_out(pack, xn, txn2P, H / 256, eV3, eM3V); }
             }
             if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 6), tag + R + 6, sq, sqWhich ^= 1, eV3, eM3V); }
+            aiv_warm_drain(wpend);   // off the critical path: AIC's gu runs on xn2
 
-            // ---- stage 7: silu -> hP ----
+            // ---- stage 7: silu -> hP (SHARDED: AIV cid computes chunk cid
+            // only. gu_out = [gate(II); up(II)], 512 cols per AIC, so the
+            // gate/up 256-col runs of chunk cid come from AIC cid/2 and AIC
+            // 12+cid/2 -- gate on those two only (decouples from the
+            // slowest AIC). hP chunk cid is then written by sub0 of AIV cid;
+            // the AIC down-gemv gates on ALL 24 AIV h-writes. ----
             {
-                poll_seq(gseqp + SEQ_WANT(24 + (bid % 24), R + 6), tag + R + 6);  // gu done
-                SyncAll<false>(gsync, syncub, 48);
-                SyncAll<false>(gsync, syncub, 48);
-                const int chunks = II / 256;
-                for (int c = 0; c < chunks; c++) {
-                    LocalTensor<float> gv = (c & 1) ? ggub : ggu;
-                    LocalTensor<float> uv = (c & 1) ? uupb : uup;
-                    DataCopy(gv, tguOut[c * 256], 256);
-                    DataCopy(uv, tguOut[II + c * 256], 256);
-                    SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
-                    Sigmoid(ex0, gv, sig, 256);
-                    Mul(gv, gv, ex0, 256);                   // g * sig(g)
-                    Mul(gv, gv, uv, 256);                    // silu(g) * u
-                    Cast(hb[0], gv, RoundMode::CAST_RINT, 256);
-                    if (sub == 0) {
-                        bcast_pack(pack, hb[0]);
-                        SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
-                        DataCopy(thP[(int64_t)c * 4096], pack, 4096);
-                        SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
-                    }
+                aic_gate_poll1(gseqp, R + 6, cid >> 1, tag + R + 6);        // gate cols
+                aic_gate_poll1(gseqp, R + 6, 12 + (cid >> 1), tag + R + 6); // up cols
+                DataCopy(ggu, tguOut[cid * 256], 256);
+                DataCopy(uup, tguOut[II + cid * 256], 256);
+                SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
+                Sigmoid(ex0, ggu, sig, 256);
+                Mul(ggu, ggu, ex0, 256);                   // g * sig(g)
+                Mul(ggu, ggu, uup, 256);                   // silu(g) * u
+                Cast(hb[0], ggu, RoundMode::CAST_RINT, 256);
+                if (sub == 0) {
+                    bcast_pack(pack, hb[0]);
+                    SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
+                    DataCopy(thP[(int64_t)cid * 4096], pack, 4096);
+                    SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
                 }
             }
             if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 7), tag + R + 7, sq, sqWhich ^= 1, eV3, eM3V); }
 
             // ---- stage 8: resid2 ----
             {
-                poll_seq(gseqp + SEQ_WANT(24 + (bid % 24), R + 7), tag + R + 7);  // down done
-                SyncAll<false>(gsync, syncub, 48);
-                SyncAll<false>(gsync, syncub, 48);
+                aic_gate_poll(gseqp, R + 7, tag + R + 7, 0, 22);  // down done
                 DataCopy(xf, tdOut, H);                      // down row 0 (f32)
                 SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
                 Cast(xs, xm, RoundMode::CAST_NONE, H);
@@ -958,10 +1383,8 @@ __global__ __aicore__ void megak(
         if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, 224), tag + 224, sq, sqWhich ^= 1, eV3, eM3V); }
 
         {
-            // full gate: poll + SyncAll (lm fixpipe output must land first)
-            poll_seq(gseqp + SEQ_WANT(24 + (bid % 24), 224), tag + 224);
-            SyncAll<false>(gsync, syncub, 48);
-                SyncAll<false>(gsync, syncub, 48);
+            // 1:1 gate: this AIV's argmax reads only its own AIC's span
+            aic_gate_poll1(gseqp, 224, cid, tag + 224);
             for (int ch = 0; ch < NCH; ch++) {          // argmax over own span
                 // ping-pong buffers; NO reload (MTE2 issues can be hoisted
                 // past PipeBarrier -- never reload a tensor V ops still read)
