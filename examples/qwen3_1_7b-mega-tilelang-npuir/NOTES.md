@@ -4,9 +4,9 @@ Project: whole greedy decode step (embed gather, 28 layers, final norm, tied
 lm_head, argmax partials) in ONE kernel launch per token, on one Ascend 910B.
 
 Layout constants (mega_shapes in kernel/mega.py): NB=24 blocks (1 aic + 2 aiv),
-NSL=3 seq slices, STEP=13824 (at S=40960), SPADG=41472, SLT=256, KTILE=256,
+NSL=3 seq slices, STEP=13696 (at S=40960), SPADG=41088, SLT=128, KTILE=512,
 NQKV=4096, NQKV_PAD=4224 (24x176 contiguous slabs, 2x88 cube tiles), o/down
-NC=88 (pad 2112), gu NC=128x4 (12288 exact), lm SPAN=6331 (VPAD=151944),
+NC=88 (pad 2112), gu NC=64x8 (12288 exact), lm NC=48 (SPAN=6331, VPAD=151944),
 SPANP=8192, NCH=4, CH=2048, kpad=16. cid = sid*8 + kv (kv = cid%8,
 sid = cid//8). Weights: /home/tilelang/zuochuanuong/weights/qwen3_1_7b.
 
@@ -242,3 +242,172 @@ now at 775-797 GB/s. All gates re-passed: SEQ S=40960 (18 ckpts incl.
     not a bug. Real-weights teacher-forced SEQ (rel 0.004-0.010 at the same
     region) is the arbiter; synthetic FAIL + argmax MATCH = suspicious noise,
     verify on-manifold before bisecting.
+
+## MTE2 pipelining (2026-10-20 session)
+
+Profiled `main_mix_aic` (msprof op): the kernel is memory-bound with the
+cube-side MTE2 pipe only ~51% busy -- the rest is copy<->gemm serialization
+bubbles (single L1 tile buffers), sync latency, and small activation loads.
+Fix landed in kernel/mega.py:
+
+- qkv/gu/down/lm_head GEMVs: two L1 B-buffers (and two A-buffers) alternate
+  per kt parity; tile kt+1 streams while the cube consumes kt, with a
+  cross-round prefetch of the next nt round's first tile at kt == nkt-1.
+  The first B tile is prefetched BEFORE the activation flag wait (weights do
+  not depend on the handshake).  The buffer parity requires nkt even
+  (h//ktile = 4, ii//ktile = 12 -- holds).
+- attention K/V double-buffering, enabled L1-neutrally by SLT 256 -> 128
+  (the K/V tile pair then costs the same 64 KiB as the old single).  K/V
+  prologue loads stay behind fb+9/fb+5 (the appended row is only covered by
+  those flags -- do NOT prefetch K/V across the wait).
+- nc_gu 128 -> 64 (gu 8x64, still exact) and nc_lm 128 -> 64 to fit the
+  double buffers in the 512 KiB cbuf; the o GEMV stays single-buffered (its
+  pair lost the budget fight).
+
+Results (L=28 harness, ms/step): 4.31 -> 3.85 @sl0, 4.43 -> 3.99 @1023,
+4.85 -> 4.37 @4095, 6.19 -> 5.59 @13823, 8.39 -> 7.61 @27647,
+10.42 -> 9.45 @40959  (~-11% everywhere).  msprof: aic_mte2_ratio
+0.51 -> 0.65 (sl=511) / -> 0.75 (sl=13823); aggregate read 768 -> ~852 GB/s
+(short) / ~1108 GB/s (long).  Gates re-passed: L=2 random (S=768, 7 sl),
+SEQ teacher-forced S=4096 REAL=1 (10 checkpoints).
+
+### New traps (this session)
+
+15. **`T.gemm` operands must be whole L1 buffers, never slices.**  A sliced
+    operand with a nonzero offset (`l1_q[1:2, :]`, a BufferRegion) compiles
+    cleanly but is silently miscompiled (the offset appears to be dropped):
+    the K-head-dedup attempt computed wrong scores until the two q rows were
+    moved into separate full buffers.  This also blocks hoisting the GEMV
+    activation row to one load + per-kt slices.
+16. **Cross-scope L1 references are rejected.**  An L1 buffer allocated in
+    one `T.Scope("Cube")` cannot be referenced in a later one (compile-time
+    diagnostic), so double-buffer pairs cannot be shared across GEMV scopes.
+17. **cbuf (L1) is 512 KiB and the allocator only partially overlays**
+    disjoint scopes: the deciding metric is the total live footprint, not
+    per-scope max.  Doubling all five GEMVs needs ~736 KiB; the o pair
+    (smallest weight) was the one to drop.
+18. **K/V head-dedup is a net loss here.**  Sharing each K/V tile between
+    the two q heads of a kv group halves K/V bytes but forced SLT 128 -> 64
+    to fit L1; the doubled attention-iteration count (and smaller tiles)
+    costs more than the saved traffic -- slower at every ctx.  Reverted.
+
+### New traps (P2 merge session, 2026-10-21)
+
+19. **`PlanAndUpdateBufferAllocationLocation` is stateful and can DROP
+    allocations.**  The pass latches an internal `need_extract` flag the
+    first time a gemm accumulator (`initC=(kt==0)`) gets its LCA hoisted to
+    the layer-loop level; from then on every later buffer placement goes
+    down a fragile loop-depth arithmetic path, and lm_head's `l1_a1/l1_b1`
+    Allocate nodes silently vanished, so codegen died with
+    `cannot find variable l1_a1` inside the lm_head kt loop (the var name
+    is the shared hint -- the failing scope was NOT the merged one).
+    Kernel-side fix: one accumulator per GEMV (`l0_co/l0_cg/l0_cd`) so no
+    accumulator's uses span the whole merged scope.  Disabling the pass
+    (`tl.enable_plan_and_update_buffer_allocation: False`) is NOT an
+    option: without its sinking the cbuf/UB allocators overflow.
+20. **Buffers whose LCA is a whole scope get hoisted to the enclosing
+    loop, and the MLIR allocator anchors liveness at the alloc site.**
+    The shared o/gu/down ring landed at the `for li` top, pinning its
+    ~176 KiB across the entire layer (concurrent with qkv + attention) ->
+    cbuf 528 KiB > 512 KiB.  Fix: wrap the three GEMVs in a dynamic
+    trip-1 loop (`for _r in T.serial(T.min(sl + 1, 1))`) so the ring's
+    LCA becomes an inner ForNode; Simplify cannot fold the bound and the
+    allocator again sees per-phase lifetimes.
+
+### New traps (P1-1 session, 2026-10-21)
+
+21. **`sync_block_wait` on the cube side is a true block rendezvous: it
+    passes only after BOTH of the block's aiv subblocks call
+    `sync_block_set`** (spike: a variant where only aiv0 sets the flag hangs
+    forever; both-set completes).  Cube→aiv flags broadcast (one cube set
+    satisfies both aivs' waits).  This is what makes P1-1's subid work
+    splits safe with no extra barrier -- each aiv sets the shared flag after
+    its own half, and the cube proceeds only when both halves are done.
+    (The AscendC twin deliberately avoided FFTS for multi-setter gates --
+    "a wait passes after ONE set" for its mode-2 cross-core flags -- but
+    that is the INTER-core direction; the same-block aiv→cube INTRA flags
+    behave as a 2-party rendezvous here.)
+22. **A loop-body assignment (`x = <int expr>`) becomes a TIR let-var, and
+    using it as a `T.alloc_ub` extent creates a DYNAMIC-extent UB buffer
+    that SIGFPEs the allocator** (host-side crash, empty log; use gdb-less
+    bisection).  Fix: keep alloc extents as inline expressions of baked
+    params (`ii // 2`, not a `half_ii` variable).  Also: `T.vbrc`/`T.vmul`/
+    `T.reduce` require STATIC extents -- only `T.copy` tolerates dynamic
+    region extents (so the S3 softmax arithmetic cannot be narrowed to the
+    live slice length).
+23. **Pre-wait cache-row prefetch (P0-3) is a FIFO reorder, not a win.**
+    The cube MTE2 queue is in-order: a V0/K0 tile issued before a flag wait
+    lands ahead of the post-wait critical loads (probs row, l1_q) and delays
+    the first gemm by ~its own transfer time whenever the wait window is
+    shorter than the transfer (short ctx) -- and at long ctx the flag is
+    already set when the cube arrives (gemm1 outlasts S3), so there is no
+    window to fill.  Measured: 0.5-2.6 % slower at every ctx for both
+    depth-1 and depth-2 variants.  Pre-wait WEIGHT prefetch (P2 ring) wins
+    by contrast because weights are not consumed by the first post-wait
+    gemm.  The same FIFO+guard accounting killed the lm_head depth-2
+    prologue (P0-2): its `(kt+nt)>0` guard costs ~100 ns x 396 iterations,
+    more than the ~1.6 us saving.
+
+### New traps (P2-narrowcast session, 2026-10-22)
+
+24. **The plane-barrier lattice has provably-redundant members; audit
+    per rendezvous which data is truly cross-block.**  Two of the eight
+    per-layer plane barriers guarded nothing global: (a) fb+2 after the
+    KV append -- the slice owner appends row sl itself (fb+9 covers it),
+    and q_buf rows are rewritten identically by every block of the kv
+    group, so gemm1 has only same-block inputs; (b) fb+1 after gemm2 --
+    the S4 leader reads only its own kv group's part_m/l/acc, and the
+    already-existing fb+2 at S4 entry is a sufficient carrier: every
+    aiv arrives there behind its own cube's fb+6 (i.e. after its own
+    gemm2 or its own S3-Else stores), and arrival on PIPE_MTE3 orders
+    it after the aiv's own stores.  Removing the two barriers is
+    bitwise value-neutral (verified by GM dumps) and passed all gates.
+    Lap-safety is preserved by the surviving four cube-plane barriers
+    per layer (a block cannot lap another around a shared flag id).
+    The truly-global barriers that must stay: qkv (S2 reads a sliding
+    producer window), o/gu/down (every aiv reads the full activation
+    row), attn_flat (every cube reads all eight leaders).
+25. **A literal kv-group narrowcast cannot be built with the current
+    primitives.**  INTER FFTS rendezvous are whole-plane (all 24 cubes
+    or all 48 aivs -- spike 3k/3f), no subset mode exists, and the
+    AscendC-twin style GM seq-word polling is inexpressible: every
+    npuir codegen (`codegen_npuir{,_api,_dev,_api_a5,_dev_a5}.cc`)
+    FATALs on `WhileNode`, so data-dependent spin loops don't compile.
+    If a subset rendezvous is ever needed, the backend first needs a
+    lowering for bounded spin + scalar GM polling.
+26. **The synthetic gate has pre-existing run-to-run argmax flakiness
+    at near-ties** (trap 14 generalizes): at sl=255 with a 0.0026 top-2
+    gap the SAME baseline binary flipped kernel tokens across runs
+    (15881 vs 132059) with matching rel (~0.035-0.040).  Before
+    suspecting a new sync bug, re-run the baseline -- and verify
+    value-neutrality directly by dumping GM intermediates (part_acc,
+    attn_out, logits) for both versions and diffing bitwise.
+
+### P1-1 dual-AIV split landed (2026-10-21)
+
+Splits: S4 combine `gh = subid` (the biggest item -- leaders' aiv_vec was
+2.7x non-leaders'), S2 q-heads by subid (k/v redundant), S3 softmax
+`gh = subid`, S5'b silu by ii halves, argmax chunks 2+2.  Measured
+(bench ctx): -1.1 .. -3.4 % across 64..40959; aic_mte2_ratio +1pp
+(0.711->0.721 short, 0.739->0.750 @27647); aiv_vec -28..-37 %.  Gates:
+L=2/L=28 SL sweeps, SEQ S=1024 + S=4096 REAL teacher-forced all PASS.
+
+Remaining backlog (2026-10-21 update)
+
+- o-GEMV double buffering: DONE via the P2 merged MLP-tail scope (the
+  explicit ring made it footprint-neutral; see OPTLOG 2026-10-21).
+- P0-3 (K/V prefetch across flags): DEAD END, measured (trap 23).
+- P0-2 depth-2 prologues (qkv/lm_head): DEAD END for lm_head (measured
+  +1 %); qkv skipped by the same FIFO+guard accounting (trap 23).
+- P1-1 (dual-AIV split): DONE (this session).
+- P1-2 (narrowing PIPE_ALL): analyzed as ~zero gain (MTE2 is already idle
+  at that boundary), race risk -- not pursued.
+- P2-optional (fine-grained flags): DONE (2026-10-22) as barrier economy
+  -- fb+2#1 and fb+1#2 removed (traps 24/25); literal narrowcast blocked
+  by backend (no While, plane-wide FFTS).
+- P2 phase 2: pull qkv/attention into the same merged cube scope so their
+  weight/K/V prefetches also stream across stage boundaries.
+- Weight repacking to contiguous K-major tiles: deprioritized (the instant
+  per-block MTE2 rate is already near fair share; remaining idle is
+  inter-stage sync latency).
+- Prefill batching (outside the decode kernel's contract).

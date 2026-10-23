@@ -23,9 +23,10 @@ MAXPOS = 40960
 # libmegak.so embeds the device binary + run_megak stub; the bisheng <<<>>
 # plugin registers and launches it (rtKernelLaunchWithFlagV2). Manual
 # rtKernelLaunch HANGS for mix kernels -- never use it.
-assert os.environ.get("ASCEND_RT_VISIBLE_DEVICES") == "0", \
-    "run with ASCEND_RT_VISIBLE_DEVICES=0 (chip 3 has MTE ROB ECC faults)"
-lib = ctypes.CDLL(f"{DIR}/kernel/libmegak.so")
+assert os.environ.get("ASCEND_RT_VISIBLE_DEVICES") not in (None, "", "0", "1", "2", "3"), \
+    "chip 0~3 has MTE ROB ECC faults; chips 0 (NaN) and 1 (wrong) cubes are also " \
+    "faulty -- use e.g. ASCEND_RT_VISIBLE_DEVICES=4"
+lib = ctypes.CDLL(f"{DIR}/kernel/{os.environ.get('MEGA_LIB', 'libmegak.so')}")
 lib.run_megak.argtypes = [ctypes.c_void_p] * 36 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
 
 rt = ctypes.CDLL(os.path.join(os.environ["ASCEND_HOME_PATH"], "lib64", "libruntime.so"))
@@ -47,6 +48,33 @@ def pack_w(w, npad):
     return (wp.reshape(npad // 16, 16, K // 16, 16)
             .permute(2, 0, 1, 3).contiguous().view(-1))
 
+def pack_w_chunks(w, nGlobal, npad, slab, nc, nrd, nk):
+    """Chunk-major fractal pack for the pipelined gemv (kernel v3)."""
+    N, K = w.shape
+    maxncc = nc // 16
+    wp = torch.zeros(npad, K, dtype=torch.bfloat16, device=DEV)
+    wp[:N] = w
+    blocks = (wp.reshape(npad // 16, 16, K // 16, 16)
+               .permute(2, 0, 1, 3).contiguous())          # [kb][nb][16n][16k]
+    KB, FB = blocks.shape[0], blocks.shape[1]
+    flat = blocks.reshape(KB * FB, 256)
+    cid = torch.arange(NB, device=DEV).view(-1, 1, 1, 1, 1)
+    nt = torch.arange(nrd, device=DEV).view(1, -1, 1, 1, 1)
+    kc = torch.arange(nk, device=DEV).view(1, 1, -1, 1, 1)
+    jj = torch.arange(16, device=DEV).view(1, 1, 1, -1, 1)
+    ii = torch.arange(maxncc, device=DEV).view(1, 1, 1, 1, -1)
+    n0 = cid * slab + nt * nc
+    nlim = torch.clamp(cid * slab + slab, max=nGlobal)
+    nce = torch.clamp(torch.minimum(n0 + nc, nlim) - n0, min=0)
+    ncc = nce // 16
+    n0f = n0 // 16
+    valid = (ii < ncc) & (n0 < nGlobal)
+    src = torch.where(valid, (kc * 16 + jj) * FB + n0f + ii,
+                      torch.full_like(ii + kc + jj, KB * FB))
+    zero = torch.zeros(1, 256, dtype=torch.bfloat16, device=DEV)
+    out = torch.cat([flat, zero], dim=0)[src.reshape(-1)]
+    return out.contiguous().view(-1)
+
 def pack_a(x):
     K = x.numel()
     return x.reshape(K // 16, 16).unsqueeze(1) \
@@ -57,7 +85,7 @@ def unpack_a(p):
 
 # K (pos, D) -> KcP fractals [d-blk][s-blk][16s x 16d]
 def pack_kc(k):   # k (SPADG, D) bf16 (zero padded)
-    return (k.view(SPADG // 16, 16, 8, 16).permute(2, 0, 1, 3)
+    return (k.view(SPADG // 256, 16, 16, 8, 16).permute(0, 3, 1, 2, 4)
             .contiguous().view(-1))
 
 # V (pos, D) -> VcP fractals [s-blk][d-blk][16d x 16s]
@@ -98,11 +126,19 @@ sinT[:MAXPOS + 512] = sin_full[:SPADG]
 
 # ---------------- device buffers ----------------
 KVREGION = L * KVH * 8 * (SPADG // 16) * 256      # el per cache
-WqkvP = torch.cat([pack_w(Wqkv[i], NQKV_PAD) for i in range(L)])
-WoP = torch.cat([pack_w(Wo[i], NO_PAD) for i in range(L)])
-WguP = torch.cat([pack_w(Wgu_full[i], NGU) for i in range(L)])
-WdP = torch.cat([pack_w(Wd[i], ND_PAD) for i in range(L)])
-WlmP = pack_w(Wlm, NB * SPAN)
+_PACK_OLD = os.environ.get("MEGA_PACK") == "old"
+if _PACK_OLD:
+    WqkvP = torch.cat([pack_w(Wqkv[i], NQKV_PAD) for i in range(L)])
+    WoP = torch.cat([pack_w(Wo[i], NO_PAD) for i in range(L)])
+    WguP = torch.cat([pack_w(Wgu_full[i], NGU) for i in range(L)])
+    WdP = torch.cat([pack_w(Wd[i], ND_PAD) for i in range(L)])
+    WlmP = pack_w(Wlm, NB * SPAN)
+else:
+    WqkvP = torch.cat([pack_w_chunks(Wqkv[i], NQKV, NQKV_PAD, 176, 96, 2, H // KTILE) for i in range(L)])
+    WoP = torch.cat([pack_w_chunks(Wo[i], H, NO_PAD, 96, 96, 1, H // KTILE) for i in range(L)])
+    WguP = torch.cat([pack_w_chunks(Wgu_full[i], NGU, NGU, 512, 128, 4, H // KTILE) for i in range(L)])
+    WdP = torch.cat([pack_w_chunks(Wd[i], H, ND_PAD, 96, 96, 1, II // KTILE) for i in range(L)])
+    WlmP = pack_w_chunks(Wlm, VV, NB * SPAN, SPAN, 96, SPAN // 96, H // KTILE)
 KcP = torch.zeros(L * KVH, 8 * (SPADG // 16) * 256, dtype=torch.bfloat16, device=DEV).view(-1)
 VcP = torch.zeros(L * KVH, (SPADG // 16) * 8 * 256, dtype=torch.bfloat16, device=DEV).view(-1)
 idx_tab = torch.arange(SPANP, dtype=torch.float32, device=DEV)
@@ -110,7 +146,7 @@ idx_tab = torch.arange(SPANP, dtype=torch.float32, device=DEV)
 # (rows 0..23 AIV, 24..47 AIC; SEQ_WANT(row,r) = 4096 + (row*256+r)*16).
 # Host-zeroed ONCE -- SyncAll counters are monotonic and stale seq words
 # never match (tag += 512/launch starting at 512).
-SYNCWS = 4096 + 48 * 256 * 16
+SYNCWS = 4096 + 48 * 256 * 16 + 24576
 syncws = torch.zeros(SYNCWS, dtype=torch.int32, device=DEV)
 
 xEmb = rw(H)
@@ -264,7 +300,7 @@ def gate(sl, lstop, prefill=None):
     lkv = (lstop - 1) * KVH
     ib, ir = sl // 16, sl % 16
     kapp = KcP[lkv * 8 * (SPADG // 16) * 256:(lkv + 1) * 8 * (SPADG // 16) * 256] \
-        .view(8, SPADG // 16, 16, 16)[:, ib, ir, :].reshape(-1)
+        .view(SPADG // 256, 8, 16, 16, 16)[ib // 16, :, ib % 16, ir, :].reshape(-1)
     ok &= cmp("K append", kapp, ref["k2"][0], atol=tl)
     vapp = VcP[lkv * (SPADG // 16) * 8 * 256:(lkv + 1) * (SPADG // 16) * 8 * 256] \
         .view(SPADG // 16, 8, 16, 16)[ib, :, :, ir].reshape(-1)
@@ -310,6 +346,8 @@ def gate(sl, lstop, prefill=None):
     lg = logits.view(16, NB, SPANP)[0]
     got_lg = torch.cat([lg[c, :SPAN] for c in range(NB - 1)] +
                        [lg[NB - 1, :VV - (NB - 1) * SPAN]])
+    if os.environ.get("MEGA_DUMP"):
+        torch.save({"got": got_lg.cpu(), "ref": ref["logits"].cpu()}, os.environ["MEGA_DUMP"])
     ok &= cmp("logits", got_lg, ref["logits"], atol=1e-1 * (1 + (lstop - 1) * 0.35))
     # argmax
     gmax = part_max.view(NB * NCH, 16)[:, 0].view(NB, NCH)
