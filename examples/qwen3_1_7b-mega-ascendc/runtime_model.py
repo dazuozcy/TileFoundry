@@ -218,7 +218,6 @@ class _Runtime:
     # ---- one launch: token at position pos -> argmax token id ----
     def launch_step(self, pos: int) -> int:
         self.partAccP.zero_()
-        self.logits.fill_(-1e30)
         tag = (self.launch_no + 1) * 512       # stale seq words never match
         self.launch_no += 1
         stream = torch.npu.current_stream().npu_stream
@@ -227,12 +226,10 @@ class _Runtime:
             *[ctypes.c_void_p(t.data_ptr()) for t in self.ptrs],
             pos, L, tag, 24, ctypes.c_void_p(stream),
         )
-        torch.npu.synchronize()
-        pm = self.part_max.view(NB * NCH, 16)[:, 0].view(NB, NCH)
-        pi = self.part_idx.view(NB * NCH, 16)[:, 0].view(NB, NCH)
-        b = int(torch.argmax(pm))
-        span, ch = b // NCH, b % NCH
-        return int(pi[span, ch]) + span * SPAN
+        pm = torch.as_tensor(self.part_max.cpu()).numpy().reshape(NB * NCH, 16)[:, 0]
+        pi = torch.as_tensor(self.part_idx.cpu()).numpy().reshape(NB * NCH, 16)[:, 0]
+        b = int(pm.argmax())
+        return int(pi[b]) + (b // NCH) * SPAN
 
     # ---- outputs, in the HIR's shapes ----
     def read_logits(self) -> torch.Tensor:
