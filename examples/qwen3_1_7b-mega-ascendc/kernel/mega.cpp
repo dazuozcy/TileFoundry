@@ -17,8 +17,8 @@
 //     replicated on AIVs; GM writes + seq writes done by sub==0 only.
 //
 // Layouts (verified on hardware):
-//   * A-side GEMV fractal source: x broadcast 16 rows per k-fractal
-//     (AIV builds via Copy{1,0,8,0} per src block, probe11).
+//   * GEMV A inputs: two compact ND rows per 256-element chunk; MTE2
+//     expands rows 0/1 into the L1 fractal. Row 1 remains the sentinel row.
 //   * B-side fractal source: [k-block][n-block][16n x 16k] row-major.
 //   * K cache KcP: [li*8+kv][d-block j][s-block i][16s x 16d] (d-major).
 //   * V cache VcP: [li*8+kv][s-block i][d-block j][16d x 16s] (s-major).
@@ -55,7 +55,7 @@
 //     cycles 4 ids. V_MTE3 / MTE3_V / MTE2_S / MTE3_MTE2 ids are reusable.
 //   * UB-source reuse after a GM DataCopy needs a trailing MTE3_V (or
 //     MTE3_MTE2 before an MTE2 reload); scalar reads of MTE2-loaded data
-//     need MTE2_S; scalar reads of vector data need PipeBarrier<PIPE_V>.
+//     need MTE2_S; vector/scalar scratch reuse needs V_S and S_V events.
 //
 // lstop: number of layers to run (1..L) before the final lm -- validation
 // slicing; all intermediates live in GM and are inspectable post-launch.
@@ -86,8 +86,25 @@ constexpr int NC_GU = 128;
 constexpr int ND_PAD = 2304;     // NB*96
 constexpr int NC_D = 96;
 constexpr int SPAN = 6336;       // ceil(VV/NB) = 6331 -> 16-mult
-constexpr int NC_LM = 96;
-constexpr int NRD_LM = SPAN / NC_LM;  // 66
+#ifndef MEGA_LM_TILE
+#define MEGA_LM_TILE 96
+#endif
+#ifndef MEGA_LM_STREAM
+#define MEGA_LM_STREAM 1
+#endif
+constexpr int PR_LM = 234;       // final-head chunk progress; tag + chunk + 1
+#ifndef MEGA_COMPACT_A
+#define MEGA_COMPACT_A 1
+#endif
+#ifndef MEGA_GU_INTERLEAVE
+#define MEGA_GU_INTERLEAVE 1
+#endif
+constexpr int A_PACK_CHUNK = MEGA_COMPACT_A ? 512 : 4096;
+constexpr int A_PACK_ROWS = MEGA_COMPACT_A ? 2 : 16;
+constexpr int NC_LM = MEGA_LM_TILE;
+static_assert(NC_LM > 0 && NC_LM <= 128 && NC_LM % 16 == 0,
+              "LM tile must fit the 64KB weight ring slot");
+constexpr int NRD_LM = (SPAN + NC_LM - 1) / NC_LM;
 constexpr int SPANP = 8192;
 constexpr int CH = 2048;
 constexpr int NCH = SPAN / CH + 1;    // 4 (last chunk 192 valid)
@@ -100,7 +117,7 @@ constexpr int QKV_LAYER = NB * 2 * (H / KTILE) * 16 * (NC_QKV / 16) * 256;   // 
 constexpr int O_LAYER = NB * 1 * (H / KTILE) * 16 * (NC_O / 16) * 256;       // = NO_PAD*H
 constexpr int GU_LAYER = NB * 4 * (H / KTILE) * 16 * (NC_GU / 16) * 256;     // = NGU*H
 constexpr int D_LAYER = NB * 1 * (II / KTILE) * 16 * (NC_D / 16) * 256;      // = ND_PAD*II
-constexpr int LM_LAYER = NB * NRD_LM * (H / KTILE) * 16 * (NC_LM / 16) * 256;  // = NB*SPAN*H
+constexpr int LM_LAYER = NB * NRD_LM * (H / KTILE) * 16 * (NC_LM / 16) * 256;  // includes per-slab N-tile padding
 
 // seq workspace layout (int32), carved out of p_syncws:
 //   [0, 1536)                SyncAll GM ws (48 x 8) -- unused in v2
@@ -109,6 +126,9 @@ constexpr int LM_LAYER = NB * NRD_LM * (H / KTILE) * 16 * (NC_LM / 16) * 256;  /
 //                           = 4096 + (row*256 + r)*16  (max 196608)
 constexpr int SEQ_OFF = 4096;
 constexpr int SEQ_ROUNDS = 256;        // 8*28 + finals headroom
+// Double-buffer the previous layer's head maxima. A current-layer
+// slice must never overwrite the shift before another slice has read it.
+constexpr int SHIFT_HISTORY = SEQ_OFF + 48 * SEQ_ROUNDS * 16 + 4096;
 __aicore__ inline int SEQ_WANT(int cid, int r) { return SEQ_OFF + (cid * 256 + r) * 16; }
 
 // ---- v7 fine-grained producer/consumer progress words (see OPTLOG R6) ----
@@ -124,7 +144,12 @@ __aicore__ inline int SEQ_WANT(int cid, int r) { return SEQ_OFF + (cid * 256 + r
 // previous token can never satisfy `>= want` (the old count is >512 behind).
 constexpr int PROG_SPAN = 16;          // grains/layer (softmax chunks <= 14)
 constexpr int PR_PROBS = 232;          // round idx: AIV->AIC probs chunks landed
+constexpr int PR_SCORES = 233;         // round idx: AIC->AIV score groups landed
 // (232/233 sit above the per-layer rounds 0..223 and the 224 finals round)
+// R13 (2a): the scores->softmax hand-off is streamed per 4096-position group
+// (16 score tiles) instead of one whole-slice barrier, so pass 1's max overlaps
+// gemm1's K stream.  Numerics are unchanged: the slice max is the max of the
+// same 4096-wide reductions, merged in the same order.
 
 // ---- v2 sentinel gates (replace poll+2xSyncAll; see OPTLOG/README) ----
 // AIC arms a DEAD-ROW word in its own fixpipe region with SENT at layer
@@ -132,7 +157,38 @@ constexpr int PR_PROBS = 232;          // round idx: AIV->AIC probs chunks lande
 // (!= SENT), then publishes its seq word at SEQ_WANT(24+cid, r). Consumers
 // poll the seq word(s) -- single word for 1:1 gates, the [c0,c1) range for
 // all-24 gates. No plane SyncAll anywhere.
+// R27 generality test hook: build with -DMEGA_SCORE_BUMP=<int> to add that
+// constant to every scaled score.  Softmax is shift invariant, so the token
+// must be unchanged -- but a shift-0 build with a bump > 88 MUST produce inf
+// (that is the whole point: it proves the carried shift, not a lucky constant,
+// is what keeps the exponent in range).  Off by default, zero cost.
+#ifndef MEGA_SCORE_BUMP
+#define MEGA_SCORE_BUMP 0
+#endif
 constexpr int SENT = 0x7FC00000;       // qNaN bit pattern: never a real f32 GEMV value
+
+// Optional diagnostic timestamps. Each traced core owns complete 128B lines.
+// Stored in the existing extra sync workspace; disabled builds emit no stamps.
+#ifndef MEGA_TIMELINE
+#define MEGA_TIMELINE 0
+#endif
+#if MEGA_TIMELINE
+constexpr int TRACE_BASE = SEQ_OFF + 48 * SEQ_ROUNDS * 16;
+__aicore__ inline void mega_stamp(GM_ADDR workspace, int plane, int layer, int event) {
+    volatile __gm__ int32_t* p = reinterpret_cast<volatile __gm__ int32_t*>(workspace)
+        + TRACE_BASE + (plane * (L + 1) + layer) * 32 + event;
+    *p = static_cast<int32_t>(GetSystemCycle());
+    __asm__ __volatile__("" ::: "memory");
+    dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+         cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+    __asm__ __volatile__("" ::: "memory");
+}
+#define TRACE_C(layer, event) do { if ((cid % 8) == 0) mega_stamp(p_syncws, cid / 8, layer, event); } while (0)
+#define TRACE_V(layer, event) do { if (cid == 0 && sub == 0) mega_stamp(p_syncws, 3, layer, event); } while (0)
+#else
+#define TRACE_C(layer, event) do {} while (0)
+#define TRACE_V(layer, event) do {} while (0)
+#endif
 
 // ---------------- cube helpers ----------------
 struct CubeCtx {
@@ -210,6 +266,10 @@ __aicore__ inline void aic_arm(volatile __gm__ float* p) {
 // AIC: after the gate's fixpipes, poll the armed word until data (!= SENT)
 // lands in L2. Detection of the actual landing -- replaces the SyncAll delay.
 __aicore__ inline void aic_wait_land(volatile __gm__ float* p) {
+    // FIX_M only retires the L0C source. Scalar publication additionally
+    // depends on completion of the outstanding FIX destination writes.
+    SetFlag<HardEvent::FIX_S>((event_t)0);
+    WaitFlag<HardEvent::FIX_S>((event_t)0);
     while (*(volatile __gm__ int32_t*)p == SENT) {
         dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
              cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
@@ -251,11 +311,50 @@ __aicore__ inline void ring_fill(CubeCtx& c, GemvCtx& s, GlobalTensor<bfloat16_t
     }
 }
 
+// ---- R16: probs A-side load ------------------------------------------------
+// The gemm2 A fractal is 16 rows but only rows 0,1 are live (the two Q heads of
+// this kv head); the fixpipe keeps rows 0..2 and row 2 only feeds the sentinel.
+// So the AIV stores probs COMPACT -- [tile][head0 256][head1 256] bf16 = 1KB/tile
+// -- and the cube's MTE2 expands them into the L1 fractal with Nd2Nz, leaving
+// rows 2..15 stale (finite garbage from the previous tile/K data).  This cuts
+// the probs round trip 8x: ~568MB -> ~72MB per 40k token.
+// dst layout check: dstNzC0Stride is in C0_size (16 bf16) units, so 16 -> 256
+// elements between consecutive k-blocks = exactly the A-fractal stride, and
+// nValue=2 writes block rows 0,1 (= the 32B rows the old strided_rows produced).
+__aicore__ inline void nd2nz_probs(LocalTensor<bfloat16_t> dst,
+    GlobalTensor<bfloat16_t> src, int64_t off) {
+    Nd2NzParams p;
+    p.ndNum = 1;
+    p.nValue = 2;                  // two live heads
+    p.dValue = SLT;                // 256 positions per tile
+    p.srcNdMatrixStride = 0;
+    p.srcDValue = SLT;
+    p.dstNzC0Stride = 16;
+    p.dstNzNStride = 1;
+    p.dstNzMatrixStride = 0;
+    DataCopy(dst, src[off], p);
+}
+
+// Retain two live A rows: output row 0 and the sentinel row 1.
+__aicore__ inline void load_gemv_a(LocalTensor<bfloat16_t> dst,
+    GlobalTensor<bfloat16_t> src, int64_t chunk) {
+#if MEGA_COMPACT_A
+    Nd2NzParams p;
+    p.ndNum = 8; p.nValue = 2; p.dValue = KTILE;
+    p.srcNdMatrixStride = 512; p.srcDValue = KTILE;
+    p.dstNzC0Stride = 16; p.dstNzNStride = 1;
+    p.dstNzMatrixStride = 4096;
+    DataCopy(dst, src[chunk * A_PACK_CHUNK], p);
+#else
+    DataCopy(dst, src[chunk * A_PACK_CHUNK], 8 * 16 * KTILE);
+#endif
+}
+
 // GEMV over one weight slab set, consuming the B-side from the prefetch ring.
 // W is CHUNK-MAJOR packed: [layer][cid][nt][kc][16 kfrac][maxncc nfrac][256],
-// ragged tiles zero-padded to maxncc (Mmad runs the pad width; fixpipe trims
-// to nce). xPacked is the 16x broadcast A-fractal pack; out (16, outStride)
-// f32, row 0 valid.
+// Ragged tiles are padded to maxncc; Fixpipe trims to nce. With compact A,
+// xPacked stores two ND rows per chunk; load_gemv_a expands the L1 fractal.
+// Output row 0 is live and row 1 provides the landing sentinel.
 //
 // v5: the static B-side stream is decoupled from the gate. The caller runs
 // gemv_begin()+ring_fill() BEFORE its gate poll, so MTE2 streams the weights
@@ -264,19 +363,30 @@ __aicore__ inline void ring_fill(CubeCtx& c, GemvCtx& s, GlobalTensor<bfloat16_t
 // 8 k-chunks; a group is loaded at gate-open and later groups reloaded at
 // their boundary (nk>8 only: the down gemv).
 //
-// Events: A-group uses channel 5; ring slots use distinct channels 1..4 for
-// both MTE2_MTE1 (landed) and MTE1_MTE2 (free). The ring's leftover free-flags
-// are drained at exit so the next gemv starts clean.
+// A-group channel 5 carries ready and buffer-free events in opposite
+// directions. A free event is produced/consumed only between K groups.
+// Weight ring slots use channels 1..4,6,7; their final free events are drained.
 __aicore__ inline void gemv_ring(CubeCtx& c, GemvCtx& s, GlobalTensor<bfloat16_t> wBase,
-    GlobalTensor<bfloat16_t> xPacked, GlobalTensor<float> outBase, int outStride, int outSlab) {
+    GlobalTensor<bfloat16_t> xPacked, GlobalTensor<float> outBase, int outStride, int outSlab,
+    volatile __gm__ int32_t* inputSeq = nullptr, int inputRound = 0, int inputWant = 0,
+    volatile __gm__ int32_t* outputSeq = nullptr,
+    volatile __gm__ float* outputRow = nullptr, int outputTag = 0) {
     const int KCC = KTILE / 16;
     const int nk = s.nk;
     const int maxncc = s.maxncc;
     // A-pack group 0 (chunks 0..7) staged up-front (after the gate has opened)
-    DataCopy(c.abuf, xPacked, 8 * 16 * KTILE);
+    // Down consumes 8 K chunks at a time; wait only for that A group.
+    if (inputSeq != nullptr) {
+        for (int cc = 0; cc < 8; cc++)
+            poll_seq(inputSeq + SEQ_WANT(cc, inputRound), inputWant);
+    }
+    load_gemv_a(c.abuf, xPacked, 0);
     SetFlag<HardEvent::MTE2_MTE1>(c.evA);
     WaitFlag<HardEvent::MTE2_MTE1>(c.evA);
     bool l0cBusy = false;
+#if MEGA_LM_STREAM
+    int publishedChunks = 0;
+#endif
     for (int nt = 0; nt < s.nrdLive; nt++) {
         const int n0 = c.cid * s.slab + nt * s.nc;
         const int nlim = (c.cid * s.slab + s.slab < s.nGlobal) ? (c.cid * s.slab + s.slab) : s.nGlobal;
@@ -285,7 +395,14 @@ __aicore__ inline void gemv_ring(CubeCtx& c, GemvCtx& s, GlobalTensor<bfloat16_t
         bool l0Busy = false;
         for (int i = 0; i < nk; i++) {
             if ((i & 7) == 0 && i > 0) {            // next A group (down: 3 groups)
-                DataCopy(c.abuf, xPacked[(int64_t)i * (16 * KTILE)], 8 * 16 * KTILE);
+                // The previous group's final LoadData must finish reading
+                // abuf before MTE2 overwrites it with the next K group.
+                WaitFlag<HardEvent::MTE1_MTE2>(c.evA);
+                if (inputSeq != nullptr) {
+                    for (int cc = i; cc < i + 8; cc++)
+                        poll_seq(inputSeq + SEQ_WANT(cc, inputRound), inputWant);
+                }
+                load_gemv_a(c.abuf, xPacked, i);
                 SetFlag<HardEvent::MTE2_MTE1>(c.evA);
                 WaitFlag<HardEvent::MTE2_MTE1>(c.evA);
             }
@@ -298,6 +415,9 @@ __aicore__ inline void gemv_ring(CubeCtx& c, GemvCtx& s, GlobalTensor<bfloat16_t
             LoadData2DParams pb(0, (uint8_t)(KCC * maxncc), 1, 0, 0, false, 0);
             LoadData(c.lb2, c.ringb[b], pb);
             SetFlag<HardEvent::MTE1_MTE2>(c.eM1R[b]);                  // ring slot free
+            if ((i & 7) == 7 && i + 1 < nk) {
+                SetFlag<HardEvent::MTE1_MTE2>(c.evA);  // A-group buffer free
+            }
             SetFlag<HardEvent::MTE1_M>(c.ev1); WaitFlag<HardEvent::MTE1_M>(c.ev1);
             MmadParams mp; mp.m = 16; mp.n = maxncc * 16; mp.k = KTILE; mp.cmatrixInitVal = (i == 0);
             Mmad(c.lc1, c.la2, c.lb2, mp);
@@ -312,6 +432,21 @@ __aicore__ inline void gemv_ring(CubeCtx& c, GemvCtx& s, GlobalTensor<bfloat16_t
         Fixpipe(outBase[(int64_t)c.cid * outSlab + nt * s.nc], c.lc1, fp);
         SetFlag<HardEvent::FIX_M>(c.ev4);
         l0cBusy = true;
+#if MEGA_LM_STREAM
+        if (outputSeq != nullptr) {
+            const int live = s.nGlobal - c.cid * s.slab < s.slab
+                ? s.nGlobal - c.cid * s.slab : s.slab;
+            const int end = nt * s.nc + nce;
+            const int boundary = (publishedChunks + 1) * CH < live
+                ? (publishedChunks + 1) * CH : live;
+            if (end >= boundary) {
+                // Check actual data landing, as for the previous whole-span gate.
+                aic_wait_land(outputRow + boundary - 1);
+                aic_seq(outputSeq, SEQ_WANT(24 + c.cid, PR_LM),
+                        outputTag + ++publishedChunks);
+            }
+        }
+#endif
     }
     if (l0cBusy) { WaitFlag<HardEvent::FIX_M>(c.ev4); }
     // drain the ring's leftover slot-free flags (one per used slot; none when
@@ -321,27 +456,44 @@ __aicore__ inline void gemv_ring(CubeCtx& c, GemvCtx& s, GlobalTensor<bfloat16_t
 }
 
 // ---------------- AIV helpers ----------------
+// GetValue executes on S. A vector-pipe barrier alone is not an explicit
+// V -> S dependency. Reserve V_S event 7 for synchronous scalar readback.
+__aicore__ inline void vector_scalar_fence() {
+    SetFlag<HardEvent::V_S>((event_t)7);
+    WaitFlag<HardEvent::V_S>((event_t)7);
+}
+
+// Complete scalar reads before the same scratch is written by V again.
+__aicore__ inline void scalar_vector_fence() {
+    SetFlag<HardEvent::S_V>((event_t)7);
+    WaitFlag<HardEvent::S_V>((event_t)7);
+}
+
 // tree reduce over n (power-of-2 multiple of 8, n>=16); result in t[0..8)
 __aicore__ inline float tree_sum(LocalTensor<float> t, int n) {
     for (int len = n / 2; len >= 8; len /= 2) { Add(t, t, t[len], len); }
-    PipeBarrier<PIPE_V>();
+    vector_scalar_fence();
     float s = t.GetValue(0);
     for (int i = 1; i < 8; i++) { s += t.GetValue(i); }
+    scalar_vector_fence();
     return s;
 }
 __aicore__ inline float tree_max(LocalTensor<float> t, int n) {
     for (int len = n / 2; len >= 8; len /= 2) { Max(t, t, t[len], len); }
-    PipeBarrier<PIPE_V>();
+    vector_scalar_fence();
     float m = t.GetValue(0);
     for (int i = 1; i < 8; i++) { float x = t.GetValue(i); if (x > m) m = x; }
+    scalar_vector_fence();
     return m;
 }
 // scalar exp via 16-el vector buffer
 __aicore__ inline float vexp_scalar(LocalTensor<float> t16, float x) {
     Duplicate(t16, x, 16);
     Exp(t16, t16, 16);
-    PipeBarrier<PIPE_V>();
-    return t16.GetValue(0);
+    vector_scalar_fence();
+    float result = t16.GetValue(0);
+    scalar_vector_fence();
+    return result;
 }
 
 // rmsnorm: t (n f32, destroyed), s (n f32 scratch), gb (n bf16 gamma),
@@ -352,8 +504,12 @@ __aicore__ inline void rms_norm(LocalTensor<float> t, LocalTensor<float> s,
     const float ms = tree_sum(s, n) / (float)n;
     Duplicate(t16, ms + EPS, 16);
     Rsqrt(t16, t16, 16);
-    PipeBarrier<PIPE_V>();
-    const float r = t16.GetValue(0);
+    vector_scalar_fence();
+    float r = t16.GetValue(0);
+    // Two Newton steps recover FP32 rsqrt accuracy before BF16 rounding.
+    r = r * (1.5f - 0.5f * (ms + EPS) * r * r);
+    r = r * (1.5f - 0.5f * (ms + EPS) * r * r);
+    scalar_vector_fence();
     Muls(t, t, r, n);
     Cast(o, t, RoundMode::CAST_RINT, n);      // land bf16 (HF numerics)
     Cast(t, o, RoundMode::CAST_NONE, n);      // back to f32
@@ -374,13 +530,21 @@ __aicore__ inline void rope_apply(LocalTensor<float> t, LocalTensor<float> cosr,
     Add(t, t, r, 128);
 }
 
-// broadcast-pack: src (256 bf16) -> pack (4096 bf16): fractal j = 16 rows
-// of src[j*16..+16] (probe11)
+// Prepare one A chunk. Compact mode copies two contiguous ND rows; legacy
+// mode broadcasts all 16 rows in the fractal (probe11).
 __aicore__ inline void bcast_pack(LocalTensor<bfloat16_t> pack, LocalTensor<bfloat16_t> src) {
+#if MEGA_COMPACT_A
+    CopyRepeatParams cp;
+    cp.dstStride = 1; cp.srcStride = 1;
+    cp.dstRepeatSize = 8; cp.srcRepeatSize = 8;
+    Copy(pack, src, (uint64_t)128, (uint8_t)2, cp);
+    Copy(pack[256], src, (uint64_t)128, (uint8_t)2, cp);
+#else
     CopyRepeatParams cp; cp.dstStride = 1; cp.srcStride = 0; cp.dstRepeatSize = 8; cp.srcRepeatSize = 0;
     for (int j = 0; j < 16; j++) {
         Copy(pack[j * 256], src[j * 16], (uint64_t)128, (uint8_t)2, cp);
     }
+#endif
 }
 // strided rows: dst fractal rows {base} of nblk fractals <- src (nblk*16
 // bf16): dst block (16s + base) <- src block s (probe10-B)
@@ -400,14 +564,17 @@ __aicore__ inline void put_scalar16(GlobalTensor<float> gm, int slot, float v,
     SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
 }
 
-// pack an H-vector (bf16) from UB to a GM pack buffer in 256-el chunks
-// (trailing MTE3_V per chunk: pack is reused next chunk)
+// Pack a bf16 vector into GM A chunks using idle argmax scratch. Compact
+// mode emits eight chunks (8KB) in one transfer; legacy mode emits four
+// broadcast chunks (32KB). Both preserve the bf16 input values exactly.
 __aicore__ inline void pack_out(LocalTensor<bfloat16_t> pack, LocalTensor<bfloat16_t> v,
     GlobalTensor<bfloat16_t> gmPack, int nChunks, event_t eV3, event_t eM3V) {
-    for (int c = 0; c < nChunks; c++) {
-        bcast_pack(pack, v[c * 256]);
+    constexpr int batch = MEGA_COMPACT_A ? 8 : 4;
+    for (int b = 0; b < nChunks; b += batch) {
+        const int nc = (b + batch <= nChunks) ? batch : (nChunks - b);
+        for (int c = 0; c < nc; c++) { bcast_pack(pack[c * A_PACK_CHUNK], v[(b + c) * 256]); }
         SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
-        DataCopy(gmPack[(int64_t)c * 4096], pack, 4096);
+        DataCopy(gmPack[(int64_t)b * A_PACK_CHUNK], pack, nc * A_PACK_CHUNK);
         SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
     }
 }
@@ -463,6 +630,21 @@ __aicore__ inline void aic_gate_poll1(volatile __gm__ int32_t* gseqp, int r, int
              cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
         __asm__ __volatile__("" ::: "memory");
     }
+    __asm__ __volatile__("" ::: "memory");
+}
+
+// AIV: poll an AIC PROGRESS word (row 24+cid, round r) until it reaches `want`
+// (>= test, same monotonic-count scheme as the AIC's aic_wait_prog).  Used for
+// the streamed score-group hand-off (R13/2a).
+__aicore__ inline void aiv_wait_prog(volatile __gm__ int32_t* gseqp, int r, int cid,
+    int32_t want) {
+    volatile __gm__ int32_t* p = gseqp + SEQ_WANT(24 + cid, r);
+    while (*p < want) {
+        dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
+             cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
+        __asm__ __volatile__("" ::: "memory");
+    }
+    __asm__ __volatile__("" ::: "memory");
 }
 
 // ---- v8 AIV-side L2 warmer (see OPTLOG R7) -------------------------------
@@ -537,12 +719,14 @@ __global__ __aicore__ void megak(
     if ASCEND_IS_AIC {
         // ================= CUBE SIDE =================
         const int cid = GetBlockIdx();
+        TRACE_C(L, 0);
         const int kv = cid % KVH;
         const int sid = cid / KVH;
         const int s0 = sid * thirds;
         const int e0 = (sl + 1 < s0 + thirds) ? (sl + 1) : (s0 + thirds);
         const int sblk = (e0 > s0) ? (e0 - s0) : 0;
         const int nloc = (sblk + SLT - 1) / SLT;
+        const int ngrp = (sblk + 4095) / 4096;   // 16-tile score groups (R13/2a)
 
         TPipe pipe;
         TBuf<TPosition::A1> a1; TBuf<TPosition::B1> b1;
@@ -577,6 +761,11 @@ __global__ __aicore__ void megak(
         C.ev4 = static_cast<event_t>(pipe.FetchEventID<HardEvent::FIX_M>());
         C.ev6 = static_cast<event_t>(pipe.FetchEventID<HardEvent::MTE2_MTE1>());
         C.ev7 = static_cast<event_t>(pipe.FetchEventID<HardEvent::MTE1_MTE2>());
+        // FetchEventID only peeks at an unallocated channel. The two
+        // outstanding score/PV ping-pong transfers MUST have distinct IDs.
+        // GEMV drains the ring before these stages, so channel 1 is free.
+        C.ev0 = (event_t)0; C.ev6 = (event_t)1;
+        C.ev5 = (event_t)0; C.ev7 = (event_t)1;
         // v5 ring: FetchEventID only PEEKS (always 0), so the 4 slot channels
         // are hardcoded (distinct ids 1..4 verified on dav-2201).
         C.eM2R[0] = (event_t)1; C.eM2R[1] = (event_t)2;
@@ -646,13 +835,22 @@ __global__ __aicore__ void megak(
         const int qkvSC = ((cid + 1) * 176 < NQKV ? (cid + 1) * 176 : NQKV) - 1;
         const int odSC = ((cid + 1) * 96 < H ? (cid + 1) * 96 : H) - 1;
         const int guSC = cid * 512 + 511;
-        const int lmSC = (cid < 23) ? (65 * NC_LM + 95) : (64 * NC_LM + 63);
+        const int lmLive = (VV - cid * SPAN < SPAN) ? VV - cid * SPAN : SPAN;
+        const int lmSC = lmLive - 1;
         const bool odActive = (cid * 96 < H);   // AICs 22,23 skip o/d gemv
         // lm sentinel armed once per launch (logits region is host-prefilled)
+#if MEGA_LM_STREAM
+        for (int ch = 0; ch < NCH; ch++) {
+            const int end = (ch + 1) * CH < lmLive ? (ch + 1) * CH : lmLive;
+            aic_arm(glogitsF + cid * SPANP + end - 1);
+        }
+#else
         aic_arm(glogitsF + cid * SPANP + lmSC);
+#endif
 
         for (int li = 0; li < lstop; li++) {
             const int R = li * 8;
+            TRACE_C(li, 0);
             // ---- arm this layer's sentinel words (dead rows of the fixpipe
             // regions). Dead rows are never read by AIVs, so arming is safe
             // regardless of how far the AIVs still are in layer li-1. The
@@ -662,29 +860,48 @@ __global__ __aicore__ void megak(
             const int sr2 = 2;                 // dead row 2 (scores/PV write mSize=3)
             aic_arm(gqkvF + sr * NQKV_PAD + qkvSC);
             if (sblk > 0) {
-                aic_arm(gscoresF + (int64_t)(cid * 16 + sr2) * STEP + s0 + (nloc - 1) * SLT + (SLT - 1));
+                // one dead-row sentinel per 4096-position score group (R13/2a) so
+                // the AIV can start the max pass as tiles land instead of after
+                // the whole slice.  group g ends at tile min(16g+15, nloc-1); the
+                // last group's word IS the old single all-scores sentinel.
+                for (int g = 0; g < ngrp; g++) {
+                    const int ti = ((g + 1) * 16 - 1 < nloc - 1) ? (g + 1) * 16 - 1 : nloc - 1;
+                    aic_arm(gscoresF + (int64_t)(cid * 16 + sr2) * STEP + s0 +
+                            (int64_t)ti * SLT + (SLT - 1));
+                }
                 aic_arm(gpartAccF + ((kv * NSL + sid) * 16 + sr2) * D + (D - 1));
             }
             if (odActive) {
                 aic_arm(goF + sr * NO_PAD + odSC);
                 aic_arm(gdF + sr * ND_PAD + odSC);
             }
-            aic_arm(gguF + sr * NGU + guSC);
+            // Certify the live row read by SiLU, one marker per output tile.
+            for (int nt = 0; nt < 4; nt++) aic_arm(gguF + cid * 512 + (nt + 1) * 128 - 1);
+            // Retire scalar sentinel stores/cache cleans before DMA/Mmad
+            // can reach the corresponding Fixpipe destination.
+            SetFlag<HardEvent::S_MTE2>((event_t)0);
+            WaitFlag<HardEvent::S_MTE2>((event_t)0);
             // ---- qkv gemv (after own aiv wrote xn1P) ----
             {
                 GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWqkv + (int64_t)li * QKV_LAYER);
                 GemvCtx sq; gemv_begin(C, sq, NQKV, H, NC_QKV, 2, 176);
                 ring_fill(C, sq, tw);                            // prefetch during wait
-                poll_seq(gseq + SEQ_WANT(cid, R + 0), tag + R + 0);      // rms1 done
+                TRACE_C(li, 1);
+                poll_seq(gseq + SEQ_WANT(cid, R + 0), tag + R + 0);
+                TRACE_C(li, 2);      // rms1 done
                 gemv_ring(C, sq, tw, txn1P, tqkvOut, NQKV_PAD, 176);
+                TRACE_C(li, 3);
             }
             aic_wait_land(gqkvF + sr * NQKV_PAD + qkvSC);
-            aic_seq(gseq, SEQ_WANT(24 + cid, R + 0), tag + R + 0);            // qkv done
+            aic_seq(gseq, SEQ_WANT(24 + cid, R + 0), tag + R + 0);
+            TRACE_C(li, 4);            // qkv done
 
             {
                 // ---- gemm1: scores per 256-tile (MTE2-pipelined across
                 // tiles: issue tile t+1 before waiting on t) ----
-                poll_seq(gseq + SEQ_WANT(cid, R + 2), tag + R + 2);  // appends done
+                poll_seq(gseq + SEQ_WANT(cid, R + 2), tag + R + 2);
+                TRACE_C(li, 5);  // appends done
+                int pubG = 0;                       // score groups published (R13/2a)
                 if (sblk > 0) {
                     const int64_t khead = (int64_t)(li * KVH + kv) * 8 * (SPADG / 16) * 256;
                     const int i0 = s0 / 16;
@@ -727,14 +944,41 @@ __global__ __aicore__ void megak(
                                 C.lc1, fp);
                         SetFlag<HardEvent::FIX_M>(C.ev4);
                         l0cBusy = true;
+                        // R13/2a: publish a 4096-position score group once its
+                        // last tile has certainly reached L2.  Checking 4 tiles
+                        // (~5us) after that tile's fixpipe keeps the land poll
+                        // off the critical path while the AIV's max pass for the
+                        // group overlaps the rest of gemm1.
+                        if ((t & 3) == 3 && t >= 19) {
+                            const int gd = (t - 19) >> 4;
+                            if (gd == pubG) {
+                                const int ti = ((gd + 1) * 16 - 1 < nloc - 1) ? (gd + 1) * 16 - 1 : nloc - 1;
+                                aic_wait_land(gscoresF + (int64_t)(cid * 16 + sr2) * STEP + s0 +
+                                              (int64_t)ti * SLT + (SLT - 1));
+                                aic_seq(gseq, SEQ_WANT(24 + cid, PR_SCORES),
+                                        tag + li * PROG_SPAN + gd + 1);
+                                pubG = gd + 1;
+                            }
+                        }
                     }
                     if (nloc >= 2) { WaitFlag<HardEvent::MTE1_MTE2>(((nloc - 2) & 1) ? C.ev7 : C.ev5); }
                     WaitFlag<HardEvent::MTE1_MTE2>(((nloc - 1) & 1) ? C.ev7 : C.ev5);
                     if (l0Busy)  { WaitFlag<HardEvent::M_MTE1>(C.ev3); }
                     if (l0cBusy) { WaitFlag<HardEvent::FIX_M>(C.ev4); }
                 }
-                if (sblk > 0) { aic_wait_land(gscoresF + (int64_t)(cid * 16 + sr2) * STEP + s0 + (nloc - 1) * SLT + (SLT - 1)); }
-                aic_seq(gseq, SEQ_WANT(24 + cid, R + 2), tag + R + 2);  // scores done
+                // R13/2a drain: publish the remaining score groups.  The last
+                // poll is exactly the old single all-scores-landed wait, so the
+                // whole-slice barrier is gone but the R+2 ordering is unchanged.
+                for (int g = pubG; g < ngrp; g++) {
+                    const int ti = ((g + 1) * 16 - 1 < nloc - 1) ? (g + 1) * 16 - 1 : nloc - 1;
+                    aic_wait_land(gscoresF + (int64_t)(cid * 16 + sr2) * STEP + s0 +
+                                  (int64_t)ti * SLT + (SLT - 1));
+                    aic_seq(gseq, SEQ_WANT(24 + cid, PR_SCORES), tag + li * PROG_SPAN + g + 1);
+                }
+                TRACE_C(li, 6);
+                // R20: the "scores done" word (24+cid, R+2) was superseded by
+                // the per-group PR_SCORES publishes above and is polled by
+                // nobody -- dropped (one scalar store + dcci / layer / AIC).
                 // ---- gemm2: PV per tile (accumulates across tiles into ONE
                 // CO1, single Fixpipe; MTE2-pipelined across tiles) ----
                 if (sblk > 0) {
@@ -748,7 +992,8 @@ __global__ __aicore__ void megak(
                     {
                         // prologue: tile 0 into parity-0 buffers (chunk 0 ready).
                         aic_wait_prog(gseq + SEQ_WANT(cid, PR_PROBS), pbase + 1);
-                        DataCopy(C.la1, tprobs2P[((int64_t)cid * NTM + 0) * 16 * 256], 16 * 256);
+                        TRACE_C(li, 7);
+                        nd2nz_probs(C.la1, tprobs2P, (int64_t)cid * NTM * 512);
                         // V layout is [s-blk][d-blk][16d x 16s]; a 256-tile is 16
                         // consecutive s-blocks => ONE contiguous 32768-el copy
                         // (was 16 x 4KB -- dominated the AIC's MTE2 instruction
@@ -767,7 +1012,7 @@ __global__ __aicore__ void megak(
                             // the chunk that owns tile t+1 before its probs copy.
                             DataCopy(b1p, tVcP[vhead + (int64_t)(i0 + (t + 1) * 16) * 8 * 256], 32768);
                             aic_wait_prog(gseq + SEQ_WANT(cid, PR_PROBS), pbase + (t + 1) / 4 + 1);
-                            DataCopy(a1p, tprobs2P[((int64_t)cid * NTM + t + 1) * 16 * 256], 16 * 256);
+                            nd2nz_probs(a1p, tprobs2P, ((int64_t)cid * NTM + t + 1) * 512);
                             SetFlag<HardEvent::MTE2_MTE1>(p2 ? C.ev6 : C.ev0);
                         }
                         WaitFlag<HardEvent::MTE2_MTE1>((t & 1) ? C.ev6 : C.ev0);
@@ -791,18 +1036,21 @@ __global__ __aicore__ void megak(
                     SetFlag<HardEvent::M_FIX>(C.ev2); WaitFlag<HardEvent::M_FIX>(C.ev2);
                     FixpipeParamsV220 fp; fp.nSize = D; fp.mSize = 3; fp.srcStride = 16;
                     fp.dstStride = D;
+                    TRACE_C(li, 8);
                     Fixpipe(tPartAcc[((int64_t)(kv * NSL + sid) * 16) * D], C.lc1, fp);
                     SetFlag<HardEvent::FIX_M>(C.ev4);
                     WaitFlag<HardEvent::FIX_M>(C.ev4);
                 }
                 if (sblk > 0) { aic_wait_land(gpartAccF + ((kv * NSL + sid) * 16 + sr2) * D + (D - 1)); }
-                aic_seq(gseq, SEQ_WANT(24 + cid, R + 4), tag + R + 4);  // partials done
+                aic_seq(gseq, SEQ_WANT(24 + cid, R + 4), tag + R + 4);
+                TRACE_C(li, 9);  // partials done
             }
             // ---- o gemv ----
             {
                 GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWo + (int64_t)li * O_LAYER);
                 GemvCtx so; gemv_begin(C, so, H, H, NC_O, 1, 96);
-                ring_fill(C, so, tw);        // prefetch Wo during the B_ATT wait
+                ring_fill(C, so, tw);
+                TRACE_C(li, 10);        // prefetch Wo during the B_ATT wait
                 // B_ATT go: poll all 8 leader words with one overlapped
                 // sweep (independent reads, dcci only on miss)
                 {
@@ -825,61 +1073,68 @@ __global__ __aicore__ void megak(
                         __asm__ __volatile__("" ::: "memory");
                     }
                 }
+                TRACE_C(li, 11);
                 gemv_ring(C, so, tw, tattnP, toOut, NO_PAD, 96);
+                TRACE_C(li, 12);
             }
             if (odActive) { aic_wait_land(goF + sr * NO_PAD + odSC); }
-            aic_seq(gseq, SEQ_WANT(24 + cid, R + 5), tag + R + 5);      // o done
+            aic_seq(gseq, SEQ_WANT(24 + cid, R + 5), tag + R + 5);
+            TRACE_C(li, 13);      // o done
             // ---- gate_up gemv ----
             {
                 GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWgu + (int64_t)li * GU_LAYER);
                 GemvCtx s; gemv_begin(C, s, NGU, H, NC_GU, 4, 512);
                 ring_fill(C, s, tw);
-                poll_seq(gseq + SEQ_WANT(cid, R + 6), tag + R + 6);      // xn2 done
+                TRACE_C(li, 14);
+                poll_seq(gseq + SEQ_WANT(cid, R + 6), tag + R + 6);
+                TRACE_C(li, 15);      // xn2 done
                 gemv_ring(C, s, tw, txn2P, tguOut, NGU, 512);
+                TRACE_C(li, 16);
             }
-            aic_wait_land(gguF + sr * NGU + guSC);
-            aic_seq(gseq, SEQ_WANT(24 + cid, R + 6), tag + R + 6);      // gu done
+            for (int nt = 0; nt < 4; nt++) aic_wait_land(gguF + cid * 512 + (nt + 1) * 128 - 1);
+            aic_seq(gseq, SEQ_WANT(24 + cid, R + 6), tag + R + 6);
+            TRACE_C(li, 17);      // gu done
             // ---- down gemv ----
-            // h is sharded: AIV c wrote hP chunk c; this AIC needs ALL of
-            // hP -> poll all 24 AIV h-done words (overlapped sweep).
+            // AIV c writes hP chunk c. Wait for each 8-chunk A group
+            // immediately before loading it; later groups overlap the GEMV.
             {
                 GlobalTensor<bfloat16_t> tw; tw.SetGlobalBuffer(gWd + (int64_t)li * D_LAYER);
                 GemvCtx s; gemv_begin(C, s, H, II, NC_D, 1, 96);
                 ring_fill(C, s, tw);
-                const int32_t want7 = tag + R + 7;
-                for (;;) {
-                    int32_t v[24];
-                    for (int cc = 0; cc < 24; cc++) {
-                        v[cc] = *(gseq + SEQ_WANT(cc, R + 7));
-                    }
-                    bool ok = true;
-                    for (int cc = 0; cc < 24; cc++) {
-                        if (v[cc] != want7) {
-                            volatile __gm__ int32_t* p = gseq + SEQ_WANT(cc, R + 7);
-                            dcci(reinterpret_cast<__gm__ uint64_t*>((__gm__ int32_t*)p),
-                                 cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
-                            ok = false;
-                        }
-                    }
-                    if (ok) break;
-                    __asm__ __volatile__("" ::: "memory");
-                }
-                gemv_ring(C, s, tw, thP, tdOut, ND_PAD, 96);
+                TRACE_C(li, 18);
+                gemv_ring(C, s, tw, thP, tdOut, ND_PAD, 96,
+                          gseq, R + 7, tag + R + 7);
+                TRACE_C(li, 19);
             }
             if (odActive) { aic_wait_land(gdF + sr * ND_PAD + odSC); }
-            aic_seq(gseq, SEQ_WANT(24 + cid, R + 7), tag + R + 7);      // down done
+            aic_seq(gseq, SEQ_WANT(24 + cid, R + 7), tag + R + 7);
+            // Empty down slabs only consumed A group 0. Retire every SiLU
+            // reader before these fast cores arm next layer's live GU markers.
+            if (!odActive) {
+                for (int c = 8; c < NB; c++) poll_seq(gseq + SEQ_WANT(c, R + 7), tag + R + 7);
+            }
+            TRACE_C(li, 20);      // down done
         }
 
         // ---- final: lm gemv + logits ----
         {
             GemvCtx s; gemv_begin(C, s, VV, H, NC_LM, NRD_LM, SPAN);
             ring_fill(C, s, tWlm);
-            poll_seq(gseq + SEQ_WANT(cid, 224), tag + 224);          // rmsf done
+            TRACE_C(L, 1);
+            poll_seq(gseq + SEQ_WANT(cid, 224), tag + 224);
+            TRACE_C(L, 2);          // rmsf done
             // lm head as a pipelined slab gemv; weights packed to NB*SPAN,
             // output spans padded to SPANP per cid (outSlab > slab).
+#if MEGA_LM_STREAM
+            gemv_ring(C, s, tWlm, txnfP, tLogits, NB * SPANP, SPANP,
+                      nullptr, 0, 0, gseq, glogitsF + cid * SPANP, tag);
+#else
             gemv_ring(C, s, tWlm, txnfP, tLogits, NB * SPANP, SPANP);
+#endif
+            TRACE_C(L, 3);
             aic_wait_land(glogitsF + cid * SPANP + lmSC);
-            aic_seq(gseq, SEQ_WANT(24 + cid, 224), tag + 224);            // logits done
+            aic_seq(gseq, SEQ_WANT(24 + cid, 224), tag + 224);
+            TRACE_C(L, 4);            // logits done
         }
     } else {
         // ================= VECTOR SIDE =================
@@ -899,6 +1154,15 @@ __global__ __aicore__ void megak(
         const int sblk2 = (e2 > 2 * thirds) ? (e2 - 2 * thirds) : 0;
         const int sidOwner = (sl / thirds < NSL) ? (sl / thirds) : (NSL - 1);
         const bool leader = (sid == 0);
+        // R27: carried softmax shift (a rescale-free online softmax).
+        // exp(x - sh) is exact for ANY sh -- it cancels in combine's num/den --
+        // so the only thing sh must do is keep the exponent in range.  Layer 0
+        // MEASURES its own slice max (one extra read, once per token); every
+        // later layer reuses the previous layer's measured max, which turns the
+        // safety condition from "max < 88" (a per-model constant) into "the max
+        // cannot grow by >88 from one layer to the next" (model independent).
+        // The in-pass max is still computed: it is what gets carried.
+        float sh0 = NEG_INF, sh1 = NEG_INF;   // R27 shift: set per layer below
 
         TPipe pipe;
         TBuf<TPosition::VECCALC> tXm, tXf, tXn, tPack, tQkv, tHead, tHb, tSm, tP2, tQ2,
@@ -944,7 +1208,9 @@ __global__ __aicore__ void megak(
         LocalTensor<float> w0 = ws[0], w1 = ws[1024];
         LocalTensor<bfloat16_t> hbw = tHbw.Get<bfloat16_t>();
         LocalTensor<bfloat16_t> pw = tPw.Get<bfloat16_t>();
-        LocalTensor<float> pwf = tPw.Get<float>();   // pass-1 wide scratch (idle in pass 2)
+        LocalTensor<float> pwf = tPw.Get<float>();   // warm-gate scratch (unused by stage 4)
+        // R24: diagnostic-max scratch (2x copy of a 1024-wide scaled row chunk)
+        LocalTensor<float> mx0 = pwf[0], mx1 = pwf[1024];
 
         // named scratch views
         LocalTensor<float> q0f = hd[0], q1f = hd[128], kf = hd[256];
@@ -963,8 +1229,10 @@ __global__ __aicore__ void megak(
         LocalTensor<float> accb = cmb[384];   // ping-pong partner for acc
         LocalTensor<float> lgc = am[0], idxc = am[2048];
         LocalTensor<float> lgcb = am[4096], idxcb = am[6144];   // argmax ping-pong
+        LocalTensor<bfloat16_t> packw = tAm.Get<bfloat16_t>();   // wide pack scratch (32KB, idle)
 
         event_t eM2V = static_cast<event_t>(pipe.FetchEventID<HardEvent::MTE2_V>());
+        event_t eV2 = static_cast<event_t>(pipe.FetchEventID<HardEvent::V_MTE2>());
         event_t eV3 = static_cast<event_t>(pipe.FetchEventID<HardEvent::V_MTE3>());
         event_t eM3V = static_cast<event_t>(pipe.FetchEventID<HardEvent::MTE3_V>());
         event_t eM3M2 = static_cast<event_t>(pipe.FetchEventID<HardEvent::MTE3_MTE2>());
@@ -1015,6 +1283,9 @@ __global__ __aicore__ void megak(
         tQkvOut.SetGlobalBuffer(gqkv_out); tScores.SetGlobalBuffer(gscores);
         tPartM.SetGlobalBuffer(gpartm);    tPartL.SetGlobalBuffer(gpartl);
         tPartAcc.SetGlobalBuffer(gpartAccP);
+        GlobalTensor<float> tShiftHistory;
+        tShiftHistory.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(p_syncws) + SHIFT_HISTORY);
+
         toOut.SetGlobalBuffer(go_out);     tguOut.SetGlobalBuffer(ggu_out);
         tdOut.SetGlobalBuffer(gd_out);     tLogits.SetGlobalBuffer(glogits);
         tIdxTab.SetGlobalBuffer(gIdxTab);
@@ -1029,6 +1300,7 @@ __global__ __aicore__ void megak(
 
         for (int li = 0; li < lstop; li++) {
             const int R = li * 8;
+            TRACE_V(li, 0);
             // ---- stage 1: rms1 -> xn1P ----
             {
                 Cast(xf, xm, RoundMode::CAST_NONE, H);
@@ -1038,10 +1310,11 @@ __global__ __aicore__ void megak(
                 }
                 SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
                 rms_norm(xf, xs, pack, xn, H, t16);
-                if (sub == 0) { pack_out(pack, xn, txn1P, H / 256, eV3, eM3V); }
+                if (sub == 0) { pack_out(packw, xn, txn1P, H / 256, eV3, eM3V); }
             }
             if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 0), tag + R + 0, sq, sqWhich ^= 1, eV3, eM3V); }
 
+            TRACE_V(li, 1);
             // ---- stage 2: qkv gate. This AIV reads only its own head's
             // q/k/v output columns, which come from a few AIC slabs -- poll
             // only those AICs so we decouple from the slowest of all 24
@@ -1055,6 +1328,7 @@ __global__ __aicore__ void megak(
                 aic_gate_poll(gseqp, R + 0, tag + R + 0, vc0 / 176, (vc0 + D - 1) / 176 + 1);
             }
 
+            TRACE_V(li, 2);
             // ---- stage 3: qk-norm, rope, appends, q2P ----
             {
                 // NOTE: direct f32 loads per region -- Cast(f32->f32,
@@ -1096,7 +1370,7 @@ __global__ __aicore__ void megak(
                         const int iRow = sl % 16;
                         const int64_t kbase = (int64_t)(li * KVH + kv) * 8 * (SPADG / 16) * 256;
                         const int64_t vbase = (int64_t)(li * KVH + kv) * (SPADG / 16) * 8 * 256;
-                        PipeBarrier<PIPE_V>();               // vb reads below
+                        vector_scalar_fence();               // vb reads below
                         for (int j = 0; j < 8; j++) {
                             DataCopy(tKcP[kbase + (int64_t)(iBlk / 16) * 32768 +
                                           (int64_t)j * 4096 + (int64_t)(iBlk % 16) * 256 + iRow * 16],
@@ -1121,76 +1395,155 @@ __global__ __aicore__ void megak(
             if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 2), tag + R + 2, sq, sqWhich ^= 1, eV3, eM3V); }
 
             {
-                // ---- stage 4: two-pass softmax -> probs2P, part_m/l ----
+                TRACE_V(li, 3);
+                // ---- stage 4: SINGLE-PASS softmax -> probs2P, part_m/l ----
                 // (1:1 gate: this AIV reads only its own AIC's score rows)
-                if (sblk > 0) { aic_gate_poll1(gseqp, R + 2, cid, tag + R + 2); }
+                // R13/2a: no whole-slice score barrier -- the pass takes its
+                // 4096-position groups as the AIC publishes them (see the
+                // PR_SCORES wait inside the loop), so it runs under gemm1's K
+                // stream instead of after it.
+                // R21: the max pass is GONE.  Softmax is shift invariant, so
+                // exp(x) with a GLOBAL shift of 0 is exactly as correct as
+                // exp(x - m_slice) as long as no exponent overflows f32
+                // (needs x > 88) or underflows bf16 (x < -87); the measured
+                // worst scaled score on the real model is 27.  Scores are now
+                // read ONCE instead of twice (-2.6MB/layer of HBM) and combine
+                // no longer rescales by exp(m_s - mg): every live slice's
+                // partial carries the same shift, so it just sums them and
+                // divides by the summed row totals.  part_m is still
+                // published (from a cheap in-pass reduce) so the gate keeps
+                // verifying the score values end to end.
                 float m0 = NEG_INF, m1 = NEG_INF, l0 = 0.0f, l1 = 0.0f;
                 const float scale = 0.08838834764831845f;  // 1/sqrt(128)
-                if (sblk > 0) {
+                // R18: sub1's softmax is dead work -- every output of stage 4
+                // (probs2P, part_m/l, R+3, combine) is sub0-only, so the second
+                // AIV of each group was re-reading the whole score slice twice
+                // for nothing (~146MB/token of HBM reads).
+                if (sub == 0 && sblk > 0) {
                     // v6: process CW=1024 positions per iteration (4 tiles) to
                     // collapse the per-tile MTE2 latency and batch the probs2P
                     // write; the tail (sblk%CW) falls back to the 256 loop.
                     const int64_t sbase0 = ((int64_t)cid * 16) * STEP + s0;
                     const int64_t sbase1 = ((int64_t)cid * 16 + 1) * STEP + s0;
-                    // pass 1 at PW=4096 (16 tiles) using the idle probs-pack
-                    // scratch (pw is only used in pass 2): 14 load/reduce
-                    // round-trips -> 4, cutting the pass-1 latency the gemm2
-                    // stream waits on.  tree_max destroys the buffer (unused).
-                    for (int c = 0; c < sblk; c += 4096) {          // pass 1: max
-                        const int cl = (c + 4096 <= sblk) ? 4096 : (sblk - c);
-                        if (cl == 4096) {
-                            DataCopy(pwf[0], tScores[sbase0 + c], 4096);
-                            DataCopy(pwf[4096], tScores[sbase1 + c], 4096);
-                            SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
-                            Muls(pwf[0], pwf[0], scale, 4096);
-                            Muls(pwf[4096], pwf[4096], scale, 4096);
-                            float tm = tree_max(pwf[0], 4096); if (tm > m0) m0 = tm;
-                            tm = tree_max(pwf[4096], 4096); if (tm > m1) m1 = tm;
-                        } else {
-                            for (int d = 0; d < cl; d += SLT) {
-                                const int tail = cl - d;
-                                DataCopy(sc0, tScores[sbase0 + c + d], SLT);
-                                DataCopy(sc1, tScores[sbase1 + c + d], SLT);
+                    // R27: every slice of a head uses ONE common shift, so the
+                    // three partials stay commensurable and combine can keep
+                    // summing them.  exp(x-sh) is exact for ANY sh (it cancels
+                    // in num/den); sh only has to stay within ~88 of the max.
+                    //   li > 0 : slice 0's max as published by the layer below.
+                    //            The value lives in a separate parity bank until
+                    //            every slice has finished the current layer.
+                    //   li == 0: measure slice 0 once.  Every core reads the
+                    //            SAME region, so all three slices get an
+                    //            identical value; layer 0 is the only layer
+                    //            with no history to carry.
+                    if (li > 0) {
+                        // Both heads are contiguous in the immutable history bank;
+                        // current maxima are published to the other bank.
+                        DataCopy(pml, tShiftHistory[((li - 1) & 1) * (KVH * 2 * 16) + kv * 2 * 16], 32);
+                        SetFlag<HardEvent::MTE2_S>(eM2S); WaitFlag<HardEvent::MTE2_S>(eM2S);
+                        sh0 = pml.GetValue(0);
+                        sh1 = pml.GetValue(16);
+                        // Sanity guard; layer 0 always bootstraps and publishes
+                        // this launch's history before layer 1 reads it.
+                        // The band only rejects NaN/inf/absurd values -- a legit
+                        // shift can be large (any constant offset is valid).
+                        if (!(sh0 > -1e5f && sh0 < 1e5f)) sh0 = 0.0f;
+                        if (!(sh1 > -1e5f && sh1 < 1e5f)) sh1 = 0.0f;
+                    } else {
+                        const int64_t b0 = ((int64_t)kv * 16) * STEP;
+                        const int sb0 = (sl + 1 < thirds) ? (sl + 1) : thirds;
+                        for (int c = 0; c < sb0; c += 4096) {
+                            aiv_wait_prog(gseqp, PR_SCORES, kv, tag + c / 4096 + 1);
+                            const int cl = (c + 4096 <= sb0) ? 4096 : (sb0 - c);
+                            if (cl == 4096) {
+                                // Protect the reduction operand until its vector readers finish.
+                                SetFlag<HardEvent::V_MTE2>(eV2); WaitFlag<HardEvent::V_MTE2>(eV2);
+                                DataCopy(pwf[0], tScores[b0 + c], 4096);
+                                DataCopy(pwf[4096], tScores[b0 + STEP + c], 4096);
                                 SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
-                                Muls(sc0, sc0, scale, SLT);
-                                Muls(sc1, sc1, scale, SLT);
-                                if (tail >= SLT) {
-                                    float tm = tree_max(sc0, SLT); if (tm > m0) m0 = tm;
-                                    tm = tree_max(sc1, SLT); if (tm > m1) m1 = tm;
-                                } else {
-                                    PipeBarrier<PIPE_V>();
-                                    for (int i = 0; i < tail; i++) {
-                                        float x = sc0.GetValue(i); if (x > m0) m0 = x;
-                                        x = sc1.GetValue(i); if (x > m1) m1 = x;
+                                Muls(pwf[0], pwf[0], scale, 4096);
+                                Muls(pwf[4096], pwf[4096], scale, 4096);
+#if MEGA_SCORE_BUMP != 0
+                                Adds(pwf[0], pwf[0], (float)MEGA_SCORE_BUMP, 4096);
+                                Adds(pwf[4096], pwf[4096], (float)MEGA_SCORE_BUMP, 4096);
+#endif
+                                float tm = tree_max(pwf[0], 4096); if (tm > sh0) sh0 = tm;
+                                tm = tree_max(pwf[4096], 4096); if (tm > sh1) sh1 = tm;
+                            } else {
+                                for (int d = 0; d < cl; d += SLT) {
+                                    const int tail = cl - d;
+                                    // Protect the reduction operand until its vector readers finish.
+                                    SetFlag<HardEvent::V_MTE2>(eV2); WaitFlag<HardEvent::V_MTE2>(eV2);
+                                    DataCopy(sc0, tScores[b0 + c + d], SLT);
+                                    DataCopy(sc1, tScores[b0 + STEP + c + d], SLT);
+                                    SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
+                                    Muls(sc0, sc0, scale, SLT);
+                                    Muls(sc1, sc1, scale, SLT);
+#if MEGA_SCORE_BUMP != 0
+                                    Adds(sc0, sc0, (float)MEGA_SCORE_BUMP, SLT);
+                                    Adds(sc1, sc1, (float)MEGA_SCORE_BUMP, SLT);
+#endif
+                                    if (tail >= SLT) {
+                                        Add(mx0, sc0, sc0, SLT);
+                                        Add(mx1, sc1, sc1, SLT);
+                                        float tm = 0.5f * tree_max(mx0, SLT); if (tm > sh0) sh0 = tm;
+                                        tm = 0.5f * tree_max(mx1, SLT); if (tm > sh1) sh1 = tm;
+                                    } else {
+                                        vector_scalar_fence();
+                                        for (int i = 0; i < tail; i++) {
+                                            float v = sc0.GetValue(i); if (v > sh0) sh0 = v;
+                                            v = sc1.GetValue(i); if (v > sh1) sh1 = v;
+                                        }
+                                        scalar_vector_fence();
                                     }
                                 }
                             }
                         }
                     }
-                    for (int c = 0; c < sblk; c += 1024) {          // pass 2: exp/probs/l
+                    // R24: one pass over the scores.  probs are exp(x - sh) with
+                    // a per-AIV carried shift (R27); the in-pass max feeds the
+                    // NEXT layer's shift, so nothing here is model specific.
+                    for (int c = 0; c < sblk; c += 1024) {          // exp/probs/l
+                        // R13/2a: the AIC publishes one 4096-position group at
+                        // a time -- wait for the group this chunk lives in.
+                        if ((c & 4095) == 0) {
+                            aiv_wait_prog(gseqp, PR_SCORES, cid,
+                                          tag + li * PROG_SPAN + c / 4096 + 1);
+                        }
                         const int cl = (c + 1024 <= sblk) ? 1024 : (sblk - c);
                         if (cl == 1024) {
+                            // Protect the reduction operand until its vector readers finish.
+                            SetFlag<HardEvent::V_MTE2>(eV2); WaitFlag<HardEvent::V_MTE2>(eV2);
                             DataCopy(w0, tScores[sbase0 + c], 1024);
                             DataCopy(w1, tScores[sbase1 + c], 1024);
                             SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
                             Muls(w0, w0, scale, 1024);
                             Muls(w1, w1, scale, 1024);
-                            Adds(w0, w0, -m0, 1024);
-                            Adds(w1, w1, -m1, 1024);
+#if MEGA_SCORE_BUMP != 0
+                            Adds(w0, w0, (float)MEGA_SCORE_BUMP, 1024);
+                            Adds(w1, w1, (float)MEGA_SCORE_BUMP, 1024);
+#endif
+                            // diagnostic slice max only (Add is an exact 2x
+                            // copy and, unlike Muls by 1.0, is not folded away)
+                            Add(mx0, w0, w0, 1024);
+                            Add(mx1, w1, w1, 1024);
+                            Adds(w0, w0, -sh0, 1024);
+                            Adds(w1, w1, -sh1, 1024);
                             Exp(w0, w0, 1024);
                             Exp(w1, w1, 1024);
+                            float tm = 0.5f * tree_max(mx0, 1024); if (tm > m0) m0 = tm;
+                            tm = 0.5f * tree_max(mx1, 1024); if (tm > m1) m1 = tm;
                             // land probs BEFORE tree_sum (it destroys in place!)
-                            Cast(hbw[0], w0, RoundMode::CAST_RINT, 1024);      // head0 bf16
+                            // R16 compact: [tile][head0 256][head1 256] bf16
+                            for (int q = 0; q < 4; q++) {
+                                Cast(hbw[q * 512], w0[q * 256], RoundMode::CAST_RINT, 256);
+                                Cast(hbw[q * 512 + 256], w1[q * 256], RoundMode::CAST_RINT, 256);
+                            }
                             l0 += tree_sum(w0, 1024);
-                            Cast(hbw[1024], w1, RoundMode::CAST_RINT, 1024);   // head1 bf16
                             l1 += tree_sum(w1, 1024);
                             if (sub == 0) {
-                                for (int q = 0; q < 4; q++) {
-                                    strided_rows(pw[q * 4096], hbw[q * 256], 16, 0);
-                                    strided_rows(pw[q * 4096], hbw[1024 + q * 256], 16, 1);
-                                }
                                 SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
-                                DataCopy(tprobs2P[((int64_t)cid * NTM + c / SLT) * 16 * 256], pw, 16 * 1024);
+                                DataCopy(tprobs2P[((int64_t)cid * NTM + c / SLT) * 512], hbw, 4 * 512);
                                 SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
                                 // v7: publish this 1024-chunk (4 tiles).  The
                                 // seq MTE3 is ordered after the probs MTE3, so
@@ -1203,13 +1556,26 @@ __global__ __aicore__ void megak(
                         } else {
                             for (int d = 0; d < cl; d += SLT) {
                                 const int tail = cl - d;
+                                // Protect the reduction operand until its vector readers finish.
+                                SetFlag<HardEvent::V_MTE2>(eV2); WaitFlag<HardEvent::V_MTE2>(eV2);
                                 DataCopy(sc0, tScores[sbase0 + c + d], SLT);
                                 DataCopy(sc1, tScores[sbase1 + c + d], SLT);
                                 SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
                                 Muls(sc0, sc0, scale, SLT);
                                 Muls(sc1, sc1, scale, SLT);
-                                Adds(sc0, sc0, -m0, SLT);
-                                Adds(sc1, sc1, -m1, SLT);
+#if MEGA_SCORE_BUMP != 0
+                                Adds(sc0, sc0, (float)MEGA_SCORE_BUMP, SLT);
+                                Adds(sc1, sc1, (float)MEGA_SCORE_BUMP, SLT);
+#endif
+                                // diagnostic slice max (valid lanes only)
+                                vector_scalar_fence();
+                                for (int i = 0; i < tail && i < SLT; i++) {
+                                    float v = sc0.GetValue(i); if (v > m0) m0 = v;
+                                    v = sc1.GetValue(i); if (v > m1) m1 = v;
+                                }
+                                scalar_vector_fence();
+                                Adds(sc0, sc0, -sh0, SLT);
+                                Adds(sc1, sc1, -sh1, SLT);
                                 Exp(ex0, sc0, SLT);
                                 Exp(ex1, sc1, SLT);
                                 Cast(hb[0], ex0, RoundMode::CAST_RINT, SLT);
@@ -1218,15 +1584,14 @@ __global__ __aicore__ void megak(
                                     l0 += tree_sum(ex0, SLT);
                                     l1 += tree_sum(ex1, SLT);
                                 } else {
-                                    PipeBarrier<PIPE_V>();
+                                    vector_scalar_fence();
                                     for (int i = 0; i < tail; i++) { l0 += ex0.GetValue(i); }
                                     for (int i = 0; i < tail; i++) { l1 += ex1.GetValue(i); }
+                                    scalar_vector_fence();
                                 }
                                 if (sub == 0) {
-                                    strided_rows(p2, hb[0], 16, 0);
-                                    strided_rows(p2, hb[256], 16, 1);
                                     SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
-                                    DataCopy(tprobs2P[((int64_t)cid * NTM + (c + d) / SLT) * 16 * 256], p2, 16 * 256);
+                                    DataCopy(tprobs2P[((int64_t)cid * NTM + (c + d) / SLT) * 512], hb, 512);
                                     SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
                                 }
                             }
@@ -1241,11 +1606,41 @@ __global__ __aicore__ void megak(
                     }
                 }
                 if (sub == 0) {
-                    put_scalar16(tPartM, (kv * 2) * NSL + sid, m0, t16, eV3, eM3V);
-                    put_scalar16(tPartM, (kv * 2 + 1) * NSL + sid, m1, t16, eV3, eM3V);
+                    // R27: part_m normally publishes this layer's slice max --
+                    // that is exactly what the next layer carries as its shift.
+                    // On the LAST layer nobody carries it, so publish the shift
+                    // that was actually used instead; that is the only way the
+                    // gate can rebuild the exp reference exactly (a common
+                    // shift is invisible end to end, but part_l/partAcc are not
+                    // shift invariant).
+                    if (sid == 0) {
+                        put_scalar16(tShiftHistory, (li & 1) * (KVH * 2) + kv * 2, m0, t16, eV3, eM3V);
+                        put_scalar16(tShiftHistory, (li & 1) * (KVH * 2) + kv * 2 + 1, m1, t16, eV3, eM3V);
+                    }
+                    const bool last = (li + 1 == lstop);
+                    put_scalar16(tPartM, (kv * 2) * NSL + sid, last ? sh0 : m0, t16, eV3, eM3V);
+                    put_scalar16(tPartM, (kv * 2 + 1) * NSL + sid, last ? sh1 : m1, t16, eV3, eM3V);
                     put_scalar16(tPartL, (kv * 2) * NSL + sid, l0, t16, eV3, eM3V);
                     put_scalar16(tPartL, (kv * 2 + 1) * NSL + sid, l1, t16, eV3, eM3V);
+                    // Retirement alone is not a publication fence between GM
+                    // addresses. Confirm both denominator values are visible
+                    // before a consumer can observe the R+3 ready word.
+                    SetFlag<HardEvent::MTE3_MTE2>(eM3M2); WaitFlag<HardEvent::MTE3_MTE2>(eM3M2);
+                    for (;;) {
+                        DataCopy(pml, tPartL[((int64_t)(kv * 2) * NSL + sid) * 16], 64);
+                        SetFlag<HardEvent::MTE2_S>(eM2S); WaitFlag<HardEvent::MTE2_S>(eM2S);
+                        if (pml.GetValue(0) == l0 && pml.GetValue(NSL * 16) == l1) break;
+                    }
+                    if (sid == 0) {
+                        for (;;) {
+                            DataCopy(pml, tShiftHistory[(li & 1) * (KVH * 2 * 16) + kv * 2 * 16], 32);
+                            SetFlag<HardEvent::MTE2_S>(eM2S); WaitFlag<HardEvent::MTE2_S>(eM2S);
+                            if (pml.GetValue(0) == m0 && pml.GetValue(16) == m1) break;
+                        }
+                    }
+
                 }
+
                 if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 3), tag + R + 3, sq, sqWhich ^= 1, eV3, eM3V); }
 
                 // ---- stage 5: combine. Leaders gate on: (a) all 3 producer
@@ -1260,51 +1655,55 @@ __global__ __aicore__ void megak(
                     aic_gate_poll1(gseqp, R + 4, kv, tag + R + 4);
                     if (sblk1 > 0) { aic_gate_poll1(gseqp, R + 4, kv + 8, tag + R + 4); }
                     if (sblk2 > 0) { aic_gate_poll1(gseqp, R + 4, kv + 16, tag + R + 4); }
-                    // combine heads 2kv, 2kv+1 over 3 slice partials
-                    DataCopy(pml, tPartM[(int64_t)(kv * 2) * NSL * 16], 6 * 16);
-                    SetFlag<HardEvent::MTE2_S>(eM2S); WaitFlag<HardEvent::MTE2_S>(eM2S);
-                    float mm[2][NSL], ll[2][NSL];
+                    // combine heads 2kv, 2kv+1 over 3 slice partials.
+                    // R21: the probs in GM are exp(scaled score) with a GLOBAL
+                    // shift of 0, so every live slice's partAcc/part_l already
+                    // carries the same scale -- no exp(m_s - mg) rescale, just
+                    // sum the live partials and divide by the summed totals.
+                    // (also drops the two part_m MTE2 round-trips from the
+                    // leader's critical path)
+                    const bool live[NSL] = { sblk > 0, sblk1 > 0, sblk2 > 0 };
+                    float ll[2][NSL];
                     for (int h = 0; h < 2; h++) {
-                        for (int s = 0; s < NSL; s++) {
-                            mm[h][s] = pml.GetValue((h * NSL + s) * 16);
-                        }
-                    }
-                    DataCopy(pml, tPartL[(int64_t)(kv * 2) * NSL * 16], 6 * 16);
-                    SetFlag<HardEvent::MTE2_S>(eM2S); WaitFlag<HardEvent::MTE2_S>(eM2S);
-                    for (int h = 0; h < 2; h++) {
-                        for (int s = 0; s < NSL; s++) {
-                            ll[h][s] = pml.GetValue((h * NSL + s) * 16);
-                        }
-                    }
-                    for (int h = 0; h < 2; h++) {
-                        float mg = mm[h][0];
-                        for (int s = 1; s < NSL; s++) { if (mm[h][s] > mg) mg = mm[h][s]; }
-                        float w[NSL], den = 0.0f;
-                        for (int s = 0; s < NSL; s++) {
-                            w[s] = vexp_scalar(t16c, mm[h][s] - mg);
-                            den += w[s] * ll[h][s];
-                        }
                         Duplicate(num, 0.0f, D);
                         for (int s = 0; s < NSL; s++) {
-                            if (w[s] == 0.0f) continue;
+                            if (!live[s]) continue;
                             LocalTensor<float> av = (s & 1) ? accb : acc;
+                            // Ping-pong alone does not protect an operand from
+                            // an MTE2 reload overtaking its pending vector Add.
+                            SetFlag<HardEvent::V_MTE2>(eV2); WaitFlag<HardEvent::V_MTE2>(eV2);
                             DataCopy(av, tPartAcc[((int64_t)(kv * NSL + s) * 16 + h) * D], D);
                             SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
-                            Muls(av, av, w[s], D);
                             Add(num, num, av, D);
                         }
+                        if (h == 0) {
+                            // read the totals only NOW: the partAcc MTE2s above
+                            // are what give the producers' part_l MTE3 time to
+                            // reach L2 (see R22 -- taking it straight off the
+                            // R+3 gate was racy).
+                            DataCopy(pml, tPartL[(int64_t)(kv * 2) * NSL * 16], 6 * 16);
+                            SetFlag<HardEvent::MTE2_S>(eM2S); WaitFlag<HardEvent::MTE2_S>(eM2S);
+                            for (int q = 0; q < 2; q++) {
+                                for (int q2 = 0; q2 < NSL; q2++) {
+                                    ll[q][q2] = pml.GetValue((q * NSL + q2) * 16);
+                                }
+                            }
+                        }
+                        float den = 0.0f;
+                        for (int s = 0; s < NSL; s++) { if (live[s]) den += ll[h][s]; }
                         Muls(num, num, 1.0f / den, D);
                         Cast(hb[h * 128], num, RoundMode::CAST_RINT, D);
                     }
                     bcast_pack(pack, hb[0]);
                     SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
-                    DataCopy(tattnP[(int64_t)(kv * 2 * D) * 16], pack, 4096);
+                    DataCopy(tattnP[(int64_t)(kv * 2 * D) * A_PACK_ROWS], pack, A_PACK_CHUNK);
                     SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
                     // B_ATT go: leaders only; AICs poll all 8 leader words
                     seq_write(gseq, SEQ_WANT(cid, R + 5), tag + R + 5, sq, sqWhich ^= 1, eV3, eM3V);
                 }
             }
 
+            TRACE_V(li, 4);
             // ---- stage 6: resid1 + rms2 -> xn2P ----
             int wpend = 0;
             {
@@ -1312,10 +1711,17 @@ __global__ __aicore__ void megak(
                 // AIC's gu weight slab (chunks 4..31; 0..3 are the AIC's ring)
                 // into L2.  Each sub takes half, so both MTE2 engines work.
                 const int64_t gub = (int64_t)li * GU_LAYER + (int64_t)cid * (32 * 32768);
-                aiv_warm_gate(gseqp, R + 5, tag + R + 5, 0, 22, tWguA,
-                              gub + (int64_t)(sub ? 18 : 4) * 32768,
-                              gub + (int64_t)(sub ? 32 : 18) * 32768,
-                              pw, pw[WARM_SLOT], wpend);
+                // R18b: the gu warm only pays when the KV stream is small enough
+                // to leave gu resident in L2 (measured: +3% at ctx=1, -0.5% at
+                // 40k where 168MB/layer of KV flushes it straight back out).
+                if (sl < 4096) {
+                    aiv_warm_gate(gseqp, R + 5, tag + R + 5, 0, 22, tWguA,
+                                  gub + (int64_t)(sub ? 18 : 4) * 32768,
+                                  gub + (int64_t)(sub ? 32 : 18) * 32768,
+                                  pw, pw[WARM_SLOT], wpend);
+                } else {
+                    aic_gate_poll(gseqp, R + 5, tag + R + 5, 0, 22);
+                }
                 DataCopy(xf, toOut, H);                      // o row 0 (f32)
                 SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
                 Cast(xs, xm, RoundMode::CAST_NONE, H);
@@ -1328,22 +1734,27 @@ __global__ __aicore__ void megak(
                 }
                 SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
                 rms_norm(xf, xs, pack, xn, H, t16);
-                if (sub == 0) { pack_out(pack, xn, txn2P, H / 256, eV3, eM3V); }
+                if (sub == 0) { pack_out(packw, xn, txn2P, H / 256, eV3, eM3V); }
             }
             if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 6), tag + R + 6, sq, sqWhich ^= 1, eV3, eM3V); }
             aiv_warm_drain(wpend);   // off the critical path: AIC's gu runs on xn2
 
-            // ---- stage 7: silu -> hP (SHARDED: AIV cid computes chunk cid
-            // only. gu_out = [gate(II); up(II)], 512 cols per AIC, so the
-            // gate/up 256-col runs of chunk cid come from AIC cid/2 and AIC
-            // 12+cid/2 -- gate on those two only (decouples from the
-            // slowest AIC). hP chunk cid is then written by sub0 of AIV cid;
-            // the AIC down-gemv gates on ALL 24 AIV h-writes. ----
+            TRACE_V(li, 5);
+            // ---- stage 7: sharded SiLU -> hP. Interleaved GU assigns
+            // gate[256] and up[256] to the same producer AIC. Legacy mode
+            // waits for the two original producer slabs. ----
             {
+#if MEGA_GU_INTERLEAVE
+                // The paired gate/up rows are produced by this AIC alone.
+                aic_gate_poll1(gseqp, R + 6, cid, tag + R + 6);
+                DataCopy(ggu, tguOut[cid * 512], 256);
+                DataCopy(uup, tguOut[cid * 512 + 256], 256);
+#else
                 aic_gate_poll1(gseqp, R + 6, cid >> 1, tag + R + 6);        // gate cols
                 aic_gate_poll1(gseqp, R + 6, 12 + (cid >> 1), tag + R + 6); // up cols
                 DataCopy(ggu, tguOut[cid * 256], 256);
                 DataCopy(uup, tguOut[II + cid * 256], 256);
+#endif
                 SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
                 Sigmoid(ex0, ggu, sig, 256);
                 Mul(ggu, ggu, ex0, 256);                   // g * sig(g)
@@ -1352,12 +1763,13 @@ __global__ __aicore__ void megak(
                 if (sub == 0) {
                     bcast_pack(pack, hb[0]);
                     SetFlag<HardEvent::V_MTE3>(eV3); WaitFlag<HardEvent::V_MTE3>(eV3);
-                    DataCopy(thP[(int64_t)cid * 4096], pack, 4096);
+                    DataCopy(thP[(int64_t)cid * A_PACK_CHUNK], pack, A_PACK_CHUNK);
                     SetFlag<HardEvent::MTE3_V>(eM3V); WaitFlag<HardEvent::MTE3_V>(eM3V);
                 }
             }
             if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, R + 7), tag + R + 7, sq, sqWhich ^= 1, eV3, eM3V); }
 
+            TRACE_V(li, 6);
             // ---- stage 8: resid2 ----
             {
                 aic_gate_poll(gseqp, R + 7, tag + R + 7, 0, 22);  // down done
@@ -1369,6 +1781,7 @@ __global__ __aicore__ void megak(
             }
         }
 
+        TRACE_V(L, 0);
         // ---- final: rmsf -> xnfP, argmax ----
         {
             Cast(xf, xm, RoundMode::CAST_NONE, H);
@@ -1378,19 +1791,27 @@ __global__ __aicore__ void megak(
             }
             SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
             rms_norm(xf, xs, pack, xn, H, t16);
-            if (sub == 0) { pack_out(pack, xn, txnfP, H / 256, eV3, eM3V); }
+            if (sub == 0) { pack_out(packw, xn, txnfP, H / 256, eV3, eM3V); }
         }
         if (sub == 0) { seq_write(gseq, SEQ_WANT(cid, 224), tag + 224, sq, sqWhich ^= 1, eV3, eM3V); }
 
         {
             // 1:1 gate: this AIV's argmax reads only its own AIC's span
+            TRACE_V(L, 1);
+#if !MEGA_LM_STREAM
             aic_gate_poll1(gseqp, 224, cid, tag + 224);
+#endif
+            TRACE_V(L, 2);
             for (int ch = 0; ch < NCH; ch++) {          // argmax over own span
+#if MEGA_LM_STREAM
+                aiv_wait_prog(gseqp, PR_LM, cid, tag + ch + 1);
+#endif
                 // ping-pong buffers; NO reload (MTE2 issues can be hoisted
                 // past PipeBarrier -- never reload a tensor V ops still read)
                 LocalTensor<float> base = (ch & 1) ? lgcb : lgc;
                 LocalTensor<float> work = (ch & 1) ? lgc : lgcb;
                 LocalTensor<float> idv = (ch & 1) ? idxcb : idxc;
+                SetFlag<HardEvent::V_MTE2>(eV2); WaitFlag<HardEvent::V_MTE2>(eV2);
                 DataCopy(base, tLogits[(int64_t)cid * SPANP + ch * CH], CH);
                 DataCopy(idv, tIdxTab[ch * CH], CH);
                 SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);
@@ -1408,6 +1829,7 @@ __global__ __aicore__ void megak(
                 }
             }
         }
+        TRACE_V(L, 3);
     }
 }
 
@@ -1431,4 +1853,13 @@ extern "C" void run_megak(void* ffts, void* wqkv, void* wo, void* wgu, void* wd,
         static_cast<uint8_t*>(d_out), static_cast<uint8_t*>(logits), static_cast<uint8_t*>(idxTab),
         static_cast<uint8_t*>(partMax), static_cast<uint8_t*>(partIdx), static_cast<uint8_t*>(syncws),
         static_cast<uint8_t*>(xnfP), sl, lstop, tag);
+}
+
+// Host-only packing descriptor; loading a library must not require callers
+// to guess the device's compile-time layouts. Legacy libraries lack this API.
+extern "C" uint32_t megak_layout() {
+    return static_cast<uint32_t>(NC_LM)
+        | (static_cast<uint32_t>(MEGA_COMPACT_A) << 16)
+        | (static_cast<uint32_t>(MEGA_GU_INTERLEAVE) << 17)
+        | (static_cast<uint32_t>(MEGA_LM_STREAM) << 18);
 }
