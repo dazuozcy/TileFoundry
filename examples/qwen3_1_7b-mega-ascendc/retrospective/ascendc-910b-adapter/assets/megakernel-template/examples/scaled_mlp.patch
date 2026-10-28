@@ -1,0 +1,21 @@
+--- a/kernel/model/stages/vector/activation.inc
++++ b/kernel/model/stages/vector/activation.inc
+@@ -19,6 +19,7 @@
+                 Sigmoid(ex0, ggu, sig, 256);
+                 Mul(ggu, ggu, ex0, 256);                   // g * sig(g)
+                 Mul(ggu, ggu, uup, 256);                   // silu(g) * u
++                Muls(ggu, ggu, 0.5f, 256);  // Example new-model computation
+                 Cast(hb[0], ggu, RoundMode::CAST_RINT, 256);
+                 if (sub == 0) {
+                     bcast_pack(pack, hb[0]);
+--- a/test_mega.py
++++ b/test_mega.py
+@@ -286,7 +286,7 @@
+         xn2 = rms_ref(x, rms2w[li])
+         gu = xn2.float() @ Wgu_full[li].float().t()
+         g, u = gu[:II], gu[II:]
+-        h = (g.float() * torch.sigmoid(g.float()) * u.float()).to(torch.bfloat16)
++        h = (0.5 * g.float() * torch.sigmoid(g.float()) * u.float()).to(torch.bfloat16)
+         dn = h.float() @ Wd[li].float().t()
+         x = (x.float() + dn).to(torch.bfloat16)
+         if li == lstop - 1:

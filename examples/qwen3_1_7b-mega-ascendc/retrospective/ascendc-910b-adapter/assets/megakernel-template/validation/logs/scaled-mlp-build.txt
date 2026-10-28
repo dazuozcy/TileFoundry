@@ -1,0 +1,4 @@
+CONTRACT PASS: 18 shared literal dimensions agree in device/runtime/reference
+This does not validate hard-coded strides, resource sizes, ABI or new-model semantics.
+d023c5d7846c358d7710675105b4a82527bde907a860aa9dca2626a96c8e19fb  libmegak.so
+BUILD PASS (compilation/ELF only; run the NPU gates separately)

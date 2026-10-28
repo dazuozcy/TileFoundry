@@ -1,0 +1,117 @@
+{
+  "verified_at_utc": "2026-10-28T04:49:39.700565+00:00",
+  "model": "Qwen3-1.7B, default R30 template; scaled MLP is a separate hook demonstration",
+  "hardware": {
+    "device": 6,
+    "name": "910B2C",
+    "health_before_test": "OK, no running processes listed by npu-smi"
+  },
+  "toolchain": {
+    "cann": "8.5.0",
+    "arch": "dav-2201",
+    "bisheng_version": "2026-01-13T09:46:36+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)"
+  },
+  "extraction": {
+    "upstream_source_sha256": "a6bc5c2b884b7a2b15feef96e36a82cb54e1b2c2a0d4d88aeba9c343934b3737",
+    "executable_token_sha256": "23b0a478e98f8e814ca1b60aef1126c9bdec1fb1fa679b31a503af50102b9475",
+    "same_executable_tokens": true
+  },
+  "build": {
+    "success": true,
+    "elf_aicore_binary_and_exports": true,
+    "binary_sha256": "355ee25d56368e96c61b58db2be9c8fe19b8a79fbf0f5ab1e1ea02b6bc6b77be",
+    "identical_to_original_r30_binary": true,
+    "log": "logs/build.txt"
+  },
+  "standalone_copy": {
+    "outside_repository": true,
+    "compiled_from_cwd_tmp": true,
+    "no_parent_source_includes": true,
+    "binary_identical": true,
+    "log": "logs/standalone-build.txt",
+    "real_decode_32_tokens_identical_to_original": true
+  },
+  "offline_contract_check": {
+    "shared_literal_dimensions": 18,
+    "default_pass": true,
+    "device_H_only_changed_to_4096_rejected": true
+  },
+  "npu_gates": [
+    {
+      "position": 0,
+      "layers": 1,
+      "live_context": 1,
+      "reference": "existing random-weight Torch op-by-op reference; tolerances unchanged",
+      "pass": true,
+      "strict_same_input_intermediate_repetitions": 8,
+      "strict_repetitions_pass": true,
+      "log": "logs/gate-0-1.txt"
+    },
+    {
+      "position": 0,
+      "layers": 28,
+      "live_context": 1,
+      "reference": "existing random-weight Torch op-by-op reference; tolerances unchanged",
+      "pass": true,
+      "strict_same_input_intermediate_repetitions": 8,
+      "strict_repetitions_pass": true,
+      "log": "logs/gate-0-28.txt"
+    },
+    {
+      "position": 300,
+      "layers": 2,
+      "live_context": 301,
+      "reference": "existing random-weight Torch op-by-op reference; tolerances unchanged",
+      "pass": true,
+      "strict_same_input_intermediate_repetitions": 8,
+      "strict_repetitions_pass": true,
+      "log": "logs/gate-300-2.txt"
+    },
+    {
+      "position": 39999,
+      "layers": 28,
+      "live_context": 40000,
+      "reference": "existing random-weight Torch op-by-op reference; tolerances unchanged",
+      "pass": true,
+      "strict_same_input_intermediate_repetitions": 8,
+      "strict_repetitions_pass": true,
+      "log": "logs/gate-39999-28.txt"
+    },
+    {
+      "position": 40959,
+      "layers": 28,
+      "live_context": 40960,
+      "reference": "existing random-weight Torch op-by-op reference; tolerances unchanged",
+      "pass": true,
+      "strict_same_input_intermediate_repetitions": 8,
+      "strict_repetitions_pass": true,
+      "log": "logs/gate-40959-28.txt"
+    }
+  ],
+  "editable_stage_demonstration": {
+    "change": "h=0.5*silu(gate)*up, before BF16 landing",
+    "patch": "../examples/scaled_mlp.patch",
+    "device_and_reference_changed_together": true,
+    "independent_copy_build_pass": true,
+    "full_depth_gate_0_28_pass": true,
+    "strict_repetitions": 8,
+    "strict_repetitions_pass": true,
+    "patch_dry_run_pass": true,
+    "build_log": "logs/scaled-mlp-build.txt",
+    "gate_log": "logs/scaled-mlp-gate-0-28.txt"
+  },
+  "real_weights": {
+    "checkpoint": "Qwen3-1.7B original checkpoint",
+    "prompt": "The capital of France is",
+    "generated_tokens": 32,
+    "independent_original_and_standalone_processes_equal": true,
+    "record": "real-token-comparison.json",
+    "packaged_real_probe_tool_tested": true
+  },
+  "limits": [
+    "No performance benchmark was rerun for this template extraction.",
+    "No independent CPU or natural long-prefix validation was newly rerun; those remain original R30 historical evidence.",
+    "Strict repetition checks cover the existing harness live intermediates, not an independent full-KV correctness proof.",
+    "A new model or hardware still requires new layout/resource/semantic validation; editing dimensions alone is insufficient."
+  ]
+}

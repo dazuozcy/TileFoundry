@@ -1,0 +1,34 @@
+/tmp/fupan-scaled-mlp-de42vggn/new-model/test_mega.py:91: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+  torch.full_like(ii + kc + jj, KB * FB))
+libmegak.so loaded, ffts=0xfee00000000
+== gate sl=0 lstop=28 ==
+  xn1P           PASS  maxdiff=0.07422
+  qkv_out        PASS  maxdiff=0.05278
+  q2P row0       PASS  maxdiff=0.04102
+  q2P row1       PASS  maxdiff=0.04688
+  K append       PASS  maxdiff=0.04102
+  V append       PASS  maxdiff=0.04113
+  scores r0      PASS  maxdiff=0.03089
+  scores r1      PASS  maxdiff=0.04035
+  part_m(shift)  PASS  maxdiff=2.376
+  part_l         PASS  maxdiff=0.3375
+  partAcc r0     PASS  maxdiff=0.9062
+  partAcc r1     PASS  maxdiff=0.08151
+  attnP          PASS  maxdiff=0.0625
+  o_out          PASS  maxdiff=0.05383
+  xn2P           PASS  maxdiff=0.07031
+  gu_out         PASS  maxdiff=0.06403
+  hP             PASS  maxdiff=0.07812
+  d_out          PASS  maxdiff=0.0358
+  xnfP           PASS  maxdiff=0.07031
+  logits         PASS  maxdiff=0.03847
+  argmax kernel=57441 ref=57441 PASS
+  repeat 1/8: PASS
+  repeat 2/8: PASS
+  repeat 3/8: PASS
+  repeat 4/8: PASS
+  repeat 5/8: PASS
+  repeat 6/8: PASS
+  repeat 7/8: PASS
+  repeat 8/8: PASS
+GATE PASS

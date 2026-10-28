@@ -1669,3 +1669,291 @@ OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 ASCEND_RT_VISIBLE_DEVICES=6 \
 
 Final source SHA256: `a6bc5c2b884b7a2b15feef96e36a82cb54e1b2c2a0d4d88aeba9c343934b3737`.
 Final binary SHA256: `355ee25d56368e96c61b58db2be9c8fe19b8a79fbf0f5ab1e1ea02b6bc6b77be`.
+
+
+## R31 — dedicate sub1 AIVs to GU prefetch (2026-10-28)
+
+Fresh profiling of the R30 release preceded selection of the retained change.
+No quantization, batching, arithmetic-order, weight-layout or host-ABI changes.
+Baseline source and binary were saved as `profiling/r31/mega.baseline.cpp` and
+`kernel/libmegak_r31_baseline.so`. Experiments use separate libraries; the
+production `kernel/libmegak.so` is rebuilt from the selected source.
+
+### Diagnosis and retained change
+
+The baseline ctx=1 Roofline reports mean AIC MTE2 occupancy 69.35%, cube
+7.63%, and AIV scalar 94.70%. At ctx=40000, MTE2 occupancy is 86.66%.
+The source still replicated norm, RoPE, residual, SiLU, argmax and gate
+polling on sub1, although only sub0 publishes model state. Sub1's useful
+work is GU weight warming for sl<4096. It now runs that prefetch loop alone,
+draining both UB/event slots after each layer. At larger contexts it returns.
+The existing seq-word protocol has no full-plane barrier requiring sub1.
+Sub0 arithmetic and its gates remain unchanged. Less redundant computation
+and polling is the likely explanation for the gain; Roofline ratios alone
+do not distinguish those contributions.
+
+### Iteration results
+
+Every benchmark alternates library order each round and checks complete
+vocabulary logits bitwise against the baseline. Failed or neutral candidates
+are retained only as diagnostic source snapshots/libraries and logs.
+
+| Experiment | Result / decision |
+|---|---|
+| Retain all eight K=2048 activation chunks in 64KB L0A across N tiles | Reference gates pass; 8–13 us slower across four contexts; reject |
+| Bounded ring indices instead of 64-bit modulo | No consistent improvement; reject |
+| Seven 48KB ring slots for N=96, six 64KB slots for GU | Small short-context fluctuation, long-context regression; reject |
+| Sub1 dedicated GU prefetch worker | Reference gates and bitwise checks pass; retain |
+| KV CACHE_MODE_LAST hint on retained version | No consistent improvement; reject |
+| Remove sub1 entirely, including GU prefetch | Short contexts regress by about 60–70 us; reject |
+| Delay sub1 prefetch until all QKV producers finish | ctx=1 regresses about 40 us; reject |
+| Skip the first six GU chunks instead of four and rebalance warm ranges | ctx=1024 regresses about 25 us; reject |
+
+Subsequent refinements found no additional stable gain. This is a measured
+local plateau over the tested schedules, not proof of a global hardware limit.
+
+### Final device Roofline
+
+Both libraries use real checkpoint weights and a fixed-position, initially
+zeroed KV prefix as a controlled timing workload. These captures do not
+represent a natural 40k prefill. Short-context captures use device 6 and
+long-context captures device 8; each pair stays on the same device. The
+profiler collected 15 distinct-tag application launches, discarded the first
+five and retained ten samples. Kernel replay cannot safely reuse this
+kernel's monotonic launch tags. Python timings during profiling include
+instrumentation and are not kernel latency.
+
+| Live context | Baseline mean us | Selected mean us | Latency reduction |
+|---:|---:|---:|---:|
+| 1 | 2946.932 | 2836.823 | 3.74% |
+| 40,000 | 6253.722 | 6205.542 | 0.77% |
+
+Raw CSV locations and all steady samples: `profiling/r31/roofline-summary.json`.
+The initial abbreviated-symbol capture selected no kernel and was terminated;
+it is excluded. Its process exited before any retained baseline samples.
+
+Final launcher timings (device 7, ten alternating rounds x60 launches;
+medians include clears and synchronization):
+
+| Live context | Baseline ms | Selected ms | Latency reduction |
+|---:|---:|---:|---:|
+| 1 | 2.975461 | 2.903743 | 2.41% |
+| 1,024 | 3.152642 | 3.101041 | 1.64% |
+| 8,192 | 3.678037 | 3.615065 | 1.71% |
+| 40,000 | 6.288116 | 6.235019 | 0.84% |
+
+### Accuracy and release checks
+
+- `gate-worker.log`: both libraries pass the existing random-weight,
+  per-operator gates at short/medium/long contexts and full depth at 40k.
+- `accuracy-4096.log`: three short prompts plus a real 4096-token prefix,
+  128 generated tokens, baseline/repeat/selected in independent processes.
+  All tokens, full vocabulary-logit hashes and complete packed K/V hashes
+  match bitwise. The selected version also passes independent CPU reference
+  validation and eight strict intermediate-state repetitions at position 4223.
+- `accuracy-max40960/summary.json`: four independent processes extend saved
+  real KV at position 40127 by 833 steps through position 40959. All tokens
+  and every FP32 vocabulary logit are bitwise identical to baseline.
+- `alternating.log`: 1024 full-depth calls on real 40k KV, alternating four
+  input tokens, compare every full vocabulary vector bitwise; all pass.
+- `bench-final.log`: every sampled output matches baseline bitwise.
+- `build-final.log`: production build passes. The production library and
+  profiled/validated `libmegak_r31_worker.so` have identical SHA256 hashes.
+- `git diff --check`: passes.
+
+Reproduce a capture (use ctx=40000 for the long case, and give each capture
+its own fresh output directory):
+
+```bash
+bash kernel/build.sh
+ASCEND_RT_VISIBLE_DEVICES=6 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH=. \
+msprof op --aic-metrics=Roofline --replay-mode=application \
+  --kernel-name=_Z5megakPhS_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_S_iii_mix_aic \
+  --output=/home/tilelang/zuochuanuong/prof/mega-asc-r31-reproduce \
+  --launch-count=15 --warm-up=0 \
+  python debug/profile_mega.py --ctx 1 --iterations 10 --lib libmegak.so
+python profiling/r31/summarize.py
+```
+
+The summary script reads the four recorded capture directories, requires
+15 records per capture and discards the first five. Snapshots and per-candidate
+build/gate/benchmark logs are under `profiling/r31/`.
+
+Final `kernel/mega.cpp` SHA256: `bfb8d9872ea3a2644bd2ba214a2a53b8798cf9ab7880dfec4dc858b15220388b`.
+
+Final `kernel/libmegak.so` SHA256: `b3c8374bd209b723ad81a476e28ac3db08acd665cfec6a66a2fbf46675371dd1`.
+
+
+## R32 — implement and measure pipeline-bubble reduction proposals (2026-10-28)
+
+**No R32 candidate is retained.** Production source and `libmegak.so` are
+identical to the R31 release at the start of this round. All implementations,
+build logs, gates, alternating timings and profiler summaries are preserved
+under `profiling/r32/`. This round does not establish that the remaining
+bubbles are unavoidable; it rejects these particular implementations.
+
+### Implementations and accuracy
+
+1. **L0C double buffering:** alternate output tiles between two 16KB
+   accumulator regions and FIX_M event IDs 0/1. A buffer is waited only when
+   reused, and both outstanding events are drained before return. GM output
+   landing checks and arithmetic order remain intact. Existing reference
+   gates pass, including full depth at 40k; sampled complete logits are
+   bitwise identical. Snapshot: `mega.l0c.cpp`; logs: `gate-l0c.log`,
+   `bench-l0c.log`.
+2. **GU K=128 L0A/L0B double buffering:** retain K=256 GM/L1 packing, select
+   two contiguous halves via LoadData, and alternate the L0 destinations.
+   Initial implementations trigger hardware L0 read/write conflicts.
+   Moving both A buffers to separate 32KB halves does not resolve correctness:
+   device 9 reports conflicts; device 10 initially matches but then fails
+   GU/h/down/final-norm gates on a repeated launch. Changing the ring refill
+   placement still reports L0B conflict on device 7. These are unresolved
+   implementation/synchronization failures, not evidence that hardware
+   double buffering is unsupported. No timing from these variants is used.
+   Snapshots/logs: `mega.gu128-*.cpp`, `gate-gu128*.log`.
+3. **GU serialized control:** single-destination K=128 with explicit
+   PIPE_ALL fences, in addition to per-transfer and per-Mmad events, passes
+   existing reference gates. Its complete sampled logits match the baseline
+   bitwise, but latency increases substantially. It is a diagnostic control,
+   not a successful double-buffer implementation. Snapshot:
+   `mega.gu128-fenced.cpp`; `gate-gu128-fenced.log`, `bench-gu128-fenced.log`.
+4. **Attention QK/PV group interleave:** for layers after layer 0 and slices
+   with multiple 4096-position groups, issue QK0, QK1, PV0, QK2, PV1, etc.
+   Preserve the PV accumulator in a separate L0C region across QK groups.
+   Layer 0 retains the original score bootstrap order to avoid waiting for
+   softmax before its shared shift can be computed. The group prologues,
+   drains, score publication and probs progress gates remain explicit.
+   Reference gates and complete-logit bitwise benchmarks pass, but 40k
+   latency regresses. Snapshot: `mega.attention.cpp`; generator:
+   `make_attention.py`; `gate-attention.log`, `bench-attention.log`.
+5. **Lighter FIX overlap:** keep a single accumulator and defer FIX_M wait
+   until after the next tile's initial L0 load, immediately before Mmad.
+   Gates and complete-logit bitwise comparisons pass; no stable speedup.
+   Snapshot: `mega.fixoverlap.cpp`; corresponding gate/bench logs.
+
+### Alternating A/B launcher measurements
+
+Device 7; eight rounds x60 timed launches per variant, except the fenced
+GU control uses six rounds x60. Order reverses each round. Values are medians
+including clears/synchronization, and each row uses its own paired baseline.
+Positive change means slower. Normal candidates cover contexts 1/1024/8192/
+40000; the clearly slower GU control covers 1/40000.
+
+| Candidate | Context | Paired baseline ms | Candidate ms | Latency change |
+|---|---:|---:|---:|---:|
+| L0C double | 1 | 2.907704 | 2.913670 | +0.205% |
+| L0C double | 40,000 | 6.245473 | 6.245885 | +0.007% |
+| Attention interleave | 1 | 2.904242 | 2.910956 | +0.231% |
+| Attention interleave | 40,000 | 6.236413 | 6.285867 | +0.793% |
+| Deferred FIX wait | 1 | 2.885864 | 2.890691 | +0.167% |
+| Deferred FIX wait | 40,000 | 6.238917 | 6.243781 | +0.078% |
+| GU K128 fenced control | 1 | 2.900284 | 3.256418 | +12.279% |
+| GU K128 fenced control | 40,000 | 6.254462 | 6.496548 | +3.871% |
+
+All successful candidate timing samples report zero full-logit difference.
+Failed asynchronous GU variants have no accepted performance results.
+
+### Fresh device Roofline
+
+Application replay, 15 distinct-tag samples, first five discarded, ten
+steady samples retained. Short-context pair uses device 6; long-context
+pair device 8. Fixed-position timing harness uses real checkpoint weights
+and initially zero KV history, rather than natural long prefill. Complete
+CSV paths, durations and pipeline ratios: `roofline-summary.json`.
+
+| Candidate | Context | Baseline mean us | Candidate mean us | Latency change |
+|---|---:|---:|---:|---:|
+| L0C double | 1 | 2840.694 | 2842.720 | +0.071% |
+| Attention interleave | 40,000 | 6208.956 | 6269.703 | +0.978% |
+
+The first L0C profiler invocation had a mistyped mangled kernel name and
+selected no kernel; it is excluded. `profile_one.py` derives the exact symbol
+from the successful baseline capture to avoid manual transcription.
+
+The measurements do not support the earlier expectation that these bubble
+reductions would improve end-to-end latency. A plausible explanation is that
+L0C destination writes are already cheap (two live rows), while extra buffer/
+event bookkeeping offsets saved waits. Attention interleave additionally
+breaks the continuous KV stream with group drains/prologues; the existing
+implementation already overlaps softmax with the score tail. These are
+interpretations, not isolated per-instruction causal measurements.
+
+### Reproduce and release state
+
+```bash
+# Rebuild a diagnostic implementation, preserving the production library.
+bash kernel/build.sh ../profiling/r32/mega.l0c.cpp libmegak_r32_l0c.so
+ASCEND_RT_VISIBLE_DEVICES=7 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHONPATH=. \
+  python debug/bench_variants.py --mode bench --strict --rounds 8 --iterations 60 \
+  --variants libmegak_r32_baseline.so:96:1:1 libmegak_r32_l0c.so:96:1:1
+# Use a fresh --label for every capture.
+python profiling/r32/profile_one.py --ctx 1 --lib libmegak_r32_l0c.so \
+  --label reproduce-l0c --device 6
+python profiling/r32/summarize.py
+```
+
+No real-checkpoint long-trajectory accuracy campaign was run for candidates
+that failed correctness or regressed in paired timing; none is released.
+The default source was restored byte for byte; the production library was
+never overwritten during experiments. The previously generated R31 pipeline
+diagrams therefore still describe the current production implementation.
+`git diff --check` passes.
+
+Restored `kernel/mega.cpp` SHA256: `bfb8d9872ea3a2644bd2ba214a2a53b8798cf9ab7880dfec4dc858b15220388b`.
+
+Restored `kernel/libmegak.so` SHA256: `b3c8374bd209b723ad81a476e28ac3db08acd665cfec6a66a2fbf46675371dd1`.
+
+## Restore TileFoundry CLI check for the R31 runtime twin (2026-10-28)
+
+The production kernel and library are unchanged by this restoration:
+source `bfb8d9872ea3a2644bd2ba214a2a53b8798cf9ab7880dfec4dc858b15220388b`,
+binary `b3c8374bd209b723ad81a476e28ac3db08acd665cfec6a66a2fbf46675371dd1`.
+The old `runtime_model.py` had fallen behind the production runtime. It now
+reads `megak_layout()`, packs chunk-major weights and paired GU rows, stages
+K caches in contiguous 256-position tiles (and reads the appended rows with
+the same layout), allocates the history workspace, defines scratch state,
+masks logits padding and synchronizes queued work before the raw launch.
+The device-0-only assertion is removed; select an idle healthy device.
+
+`acts` and `prepared` are restored relative symlinks to the neighboring npuir
+example's saved activations and HIR-layout checkpoint. Only those data are
+shared; the CLI candidate remains this directory's AscendC library. The new
+`check.sh` keeps every original tolerance and supports explicit data locations
+through `MEGA_CHECK_ACTS`, `MEGA_CHECK_WEIGHTS`, and `MEGA_CHECK_CTX`.
+
+Reproduce the original gate (device 6 was healthy and idle for this run):
+
+```bash
+QWEN3_CKPT=/home/tilelang/zuochuanuong/weights/qwen3_1_7b \
+ASCEND_RT_VISIBLE_DEVICES=6 \
+  bash check.sh --json profiling/check-r31/check-pos255.json
+```
+
+All 28 layers, original fixture pos=255 / ctx_len=256, CLI exit 0:
+
+| Output | Comparison | Result |
+|---|---|---|
+| logits | allclose 0.15/0.05; rel-L2 <=0.02 | PASS; rel-L2 0.0071062322 |
+| next token | equal | PASS; token 323 |
+| K rows | allclose 0.3/0.05; rel-L2 <=0.05 | PASS; rel-L2 0.0039665004 |
+| V rows | allclose 1.0/0.05; rel-L2 <=0.05 | PASS; rel-L2 0.0113508666 |
+
+Additional full-depth CLI cases at pos0 (ctx256), pos256 and pos257 (ctx512)
+pass every original predicate. Extended rows in the latter fixtures are zero;
+these are controlled layout boundaries, not natural-prefix generation.
+CPU tests additionally check pack/read roundtrips, unwritten-row zeros and an
+independent device-address oracle at prefixes 0,1,15,16,255,256,257,511.
+
+An extra fixture repeats the saved 256-token KV history to fill ctx512 and
+checks pos511 with a nonzero second K tile. It **fails** V-row allclose with
+max_violation 0.2450195551 (V rel-L2 0.0161847345 still passes); logits, token
+and K rows pass. The R30 baseline `libmegak_r31_baseline.so` produces exactly
+the same reported output metrics and fails the same predicate. This is not
+counted as a pass or dismissed because the fixture is synthetic: arbitrary-KV
+coverage under the original tolerances remains incomplete. No production
+kernel, HIR reference or tolerance was changed to hide it.
+
+All CLI JSONs, the failing control, CPU layout log, fixture variants and the
+hash/coverage summary are in `profiling/check-r31/`. This work restores the
+established CLI gate; it does not constitute a fresh long-prefix accuracy or
+performance campaign.

@@ -14,7 +14,7 @@
 //     (Mmad m=16, rows 0,1 = heads 2kv, 2kv+1), two-pass softmax on AIV,
 //     PV = probs2 * V per tile, LSE combine on sid==0 leader AIVs.
 //   * elementwise (rmsnorm, qk-norm, rope, silu, residuals, argmax)
-//     replicated on AIVs; GM writes + seq writes done by sub==0 only.
+//     run on sub0 AIVs; sub1 only prefetches GU weights for short contexts.
 //
 // Layouts (verified on hardware):
 //   * GEMV A inputs: two compact ND rows per 256-element chunk; MTE2
@@ -1294,6 +1294,26 @@ __global__ __aicore__ void megak(
         gsync.SetGlobalBuffer((__gm__ int32_t*)p_syncws);
         gseq.SetGlobalBuffer((__gm__ int32_t*)p_syncws);
         volatile __gm__ int32_t* gseqp = (volatile __gm__ int32_t*)p_syncws;  // poll view
+
+        // Only sub0 publishes model state. Keep sub1 as a dedicated GU
+        // prefetch worker instead of duplicating norms, RoPE, SiLU and polls.
+        // All cross-core gates use sub0/AIC seq words; no plane barrier needs
+        // sub1 participation. Drain each prefetch before reusing its UB/events.
+        if (sub != 0) {
+            if (sl < 4096) {
+                for (int li = 0; li < lstop; ++li) {
+                    const int R = li * 8;
+                    const int64_t gub = (int64_t)li * GU_LAYER
+                        + (int64_t)cid * (32 * 32768);
+                    int pending = 0;
+                    aiv_warm_gate(gseqp, R + 5, tag + R + 5, 0, 22, tWguA,
+                                  gub + 18LL * 32768, gub + 32LL * 32768,
+                                  pw, pw[WARM_SLOT], pending);
+                    aiv_warm_drain(pending);
+                }
+            }
+            return;
+        }
 
         DataCopy(xm, tEmb, H);
         SetFlag<HardEvent::MTE2_V>(eM2V); WaitFlag<HardEvent::MTE2_V>(eM2V);

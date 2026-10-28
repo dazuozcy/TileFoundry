@@ -134,8 +134,29 @@ prompt 的 token 也一个一个走这同一条路。权重一份、状态一份
 
 ## Check gate (from this directory)
 
+The CLI twin is restored for the current R31 production library (2026-10-28).
+Choose an idle healthy device; device 6 below is an example. The established
+four-output tolerances are unchanged. One-command entry:
+
+```bash
+QWEN3_CKPT=/path/to/qwen3_1_7b ASCEND_RT_VISIBLE_DEVICES=6 \
+  bash check.sh --json profiling/check-latest.json
 ```
-QWEN3_CKPT=/path/to/qwen3_1_7b ASCEND_RT_VISIBLE_DEVICES=0 \
+
+`acts` and `prepared` are restored relative symlinks to the neighboring
+`qwen3_1_7b-mega-tilelang-npuir` fixtures and HIR-layout weights. Alternate
+locations are supported by `MEGA_CHECK_ACTS` and `MEGA_CHECK_WEIGHTS`;
+`MEGA_CHECK_CTX` defaults to 256. This check uses the current AscendC library,
+not the neighboring kernel. Raw reports are under `profiling/check-r31/`.
+The original position-255 fixture and boundary positions 0/256/257 pass.
+An additional synthetic position-511 fixture (repeated KV history) fails the
+V-row allclose bound in both R31 and its R30 baseline, with identical reported
+metrics; it is not counted as a pass and no tolerance was relaxed. See the
+[complete result summary](profiling/check-r31/summary.json). Restoring this
+gate does not certify every legal KV state or a natural long-prefix trajectory.
+
+```
+QWEN3_CKPT=/path/to/qwen3_1_7b ASCEND_RT_VISIBLE_DEVICES=6 \
 tilefoundry check runtime_model.py:Qwen3MegaRT.mega_step \
     --inputs files:acts/token_ids.pt,acts/cos_cache.pt,acts/sin_cache.pt,acts/pos_ids.pt,acts/scale.pt,acts/k_caches.pt,acts/v_caches.pt \
     --weights ckpt:prepared --dim ctx_len=256 \
@@ -145,8 +166,9 @@ tilefoundry check runtime_model.py:Qwen3MegaRT.mega_step \
     --out output[3] --fn allclose --atol 1.0  --rtol 0.05 --fn rel_l2 --max 0.05
 ```
 
-PASS: logits rel_l2 0.0073, next_token equal, k_rows rel_l2 0.0048,
-v_rows rel_l2 0.0117 -- the HIR interpreter is the reference, the AscendC
+Restored R31 PASS: logits rel_l2 0.00710623, next_token equal,
+k_rows rel_l2 0.00396650, v_rows rel_l2 0.0113509 -- the HIR interpreter
+is the reference, the AscendC
 launch the candidate, at the npuir gate's documented tolerances.
 
 ## Run

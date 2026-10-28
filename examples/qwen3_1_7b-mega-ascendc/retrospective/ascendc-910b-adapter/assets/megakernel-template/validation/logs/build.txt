@@ -1,0 +1,2 @@
+355ee25d56368e96c61b58db2be9c8fe19b8a79fbf0f5ab1e1ea02b6bc6b77be  libmegak.so
+BUILD PASS (compilation/ELF only; run the NPU gates separately)
