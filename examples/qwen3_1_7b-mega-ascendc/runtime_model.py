@@ -17,7 +17,7 @@ activations and the HIR-layout checkpoint repack -- the same artifacts the
 npuir example's gate consumes; ``QWEN3_CKPT`` points ``model.py`` at the
 published checkpoint whose config it reads):
 
-  QWEN3_CKPT=<checkpoint dir> ASCEND_RT_VISIBLE_DEVICES=0 \\
+  QWEN3_CKPT=<checkpoint dir> ASCEND_RT_VISIBLE_DEVICES=6 \\
   tilefoundry check runtime_model.py:Qwen3MegaRT.mega_step \\
       --inputs files:acts/token_ids.pt,acts/cos_cache.pt,acts/sin_cache.pt,acts/pos_ids.pt,acts/scale.pt,acts/k_caches.pt,acts/v_caches.pt \\
       --weights ckpt:prepared --dim ctx_len=256 \\
@@ -63,20 +63,28 @@ NQKV, NQKV_PAD = 4096, 4224
 NO_PAD, NGU, ND_PAD = 2304, 12288, 2304
 SPAN, SPANP, NCH = 6336, 8192, 4
 SB = SPADG // 16                   # 16-position blocks per cache plane
-KREGION = 8 * SB * 256             # elements per K plane: [d_blk][s_blk]..
+KREGION = 8 * SB * 256             # K: [256-pos tile][d_blk][s_blk in tile]..
 VREGION = SB * 8 * 256             # elements per V plane: [s_blk][d_blk]..
 
 _DEV = "npu"
 
-# kernel launch (verified v2 recipe -- see kernel/build.sh):
-# libmegak.so embeds the device binary + run_megak stub; the bisheng <<<>>>
-# plugin registers and launches it.  chip 3 has MTE ROB ECC faults.
-assert os.environ.get("ASCEND_RT_VISIBLE_DEVICES") == "0", \
-    "run with ASCEND_RT_VISIBLE_DEVICES=0"
-_lib = ctypes.CDLL(os.path.join(_HERE, "kernel", "libmegak.so"))
-_lib.run_megak.argtypes = (
-    [ctypes.c_void_p] * 36 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
-)
+# Select an idle healthy device explicitly; device numbers are not an ABI rule.
+if not os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
+    raise RuntimeError("select a healthy device with ASCEND_RT_VISIBLE_DEVICES")
+_lib = ctypes.CDLL(os.path.join(_HERE, "kernel", os.environ.get("MEGA_LIB", "libmegak.so")))
+_lib.run_megak.argtypes = [ctypes.c_void_p] * 36 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
+_lib.run_megak.restype = None
+# The library, rather than environment guesses, defines the packing contract.
+_lib.megak_layout.argtypes = []
+_lib.megak_layout.restype = ctypes.c_uint32
+_layout = int(_lib.megak_layout())
+NC_LM = _layout & 0xffff
+COMPACT_A = bool(_layout & (1 << 16))
+GU_INTERLEAVE = bool(_layout & (1 << 17))
+LM_STREAM = bool(_layout & (1 << 18))
+if not 0 < NC_LM <= 128 or NC_LM % 16:
+    raise RuntimeError(f"unsupported LM tile in kernel layout: {NC_LM}")
+NRD_LM = (SPAN + NC_LM - 1) // NC_LM
 _rt = ctypes.CDLL(os.path.join(os.environ["ASCEND_HOME_PATH"], "lib64", "libruntime.so"))
 _rt.rtGetC2cCtrlAddr.restype = ctypes.c_int32
 _rt.rtGetC2cCtrlAddr.argtypes = [
@@ -84,13 +92,37 @@ _rt.rtGetC2cCtrlAddr.argtypes = [
 ]
 
 
-def _pack_w(w: torch.Tensor, npad: int) -> torch.Tensor:
-    """(N, K) row-major -> NZ fractal pack, N zero-padded to npad."""
-    n, k = w.shape
-    wp = torch.zeros(npad, k, dtype=torch.bfloat16)
-    wp[:n] = w
-    return (wp.reshape(npad // 16, 16, k // 16, 16)
-            .permute(2, 0, 1, 3).contiguous().view(-1))
+def _pack_w_chunks(w, nGlobal, npad, slab, nc, nrd, nk):
+    """Chunk-major fractal pack for the pipelined gemv (kernel v3).
+    Layout: [cid][nt][kc][16 k-frac][maxncc n-frac][256] -- one contiguous
+    block per gemv chunk so the kernel streams 32..64KB contiguous reads.
+    Ragged n-tiles are zero-padded to maxncc (Mmad runs the pad width; the
+    fixpipe trims to the real nce columns)."""
+    N, K = w.shape
+    maxncc = nc // 16
+    wp = torch.zeros(npad, K, dtype=torch.bfloat16, device=w.device)
+    wp[:N] = w
+    blocks = (wp.reshape(npad // 16, 16, K // 16, 16)
+               .permute(2, 0, 1, 3).contiguous())          # [kb][nb][16n][16k]
+    KB, FB = blocks.shape[0], blocks.shape[1]
+    flat = blocks.reshape(KB * FB, 256)
+    dev = w.device
+    cid = torch.arange(NB, device=dev).view(-1, 1, 1, 1, 1)
+    nt = torch.arange(nrd, device=dev).view(1, -1, 1, 1, 1)
+    kc = torch.arange(nk, device=dev).view(1, 1, -1, 1, 1)
+    jj = torch.arange(16, device=dev).view(1, 1, 1, -1, 1)
+    ii = torch.arange(maxncc, device=dev).view(1, 1, 1, 1, -1)
+    n0 = cid * slab + nt * nc
+    nlim = torch.clamp(cid * slab + slab, max=nGlobal)
+    nce = torch.clamp(torch.minimum(n0 + nc, nlim) - n0, min=0)
+    ncc = nce // 16
+    n0f = n0 // 16
+    valid = (ii < ncc) & (n0 < nGlobal)
+    src = torch.where(valid, (kc * 16 + jj) * FB + n0f + ii,
+                      torch.full_like(ii + kc + jj, KB * FB))
+    zero = torch.zeros(1, 256, dtype=torch.bfloat16, device=dev)
+    out = torch.cat([flat, zero], dim=0)[src.reshape(-1)]
+    return out.contiguous().view(-1)
 
 
 class _Runtime:
@@ -114,12 +146,12 @@ class _Runtime:
         self.cosT = torch.zeros(SPADG, D, dtype=torch.float32, device=_DEV)
         self.sinT = torch.zeros(SPADG, D, dtype=torch.float32, device=_DEV)
         self.idx_tab = torch.arange(SPANP, dtype=torch.float32, device=_DEV)
-        # [0,1536) SyncAll GM ws + [4096,...) seq slots; host-zeroed ONCE
-        # (SyncAll counters are monotonic; the tag advances 512 per launch)
-        self.syncws = torch.zeros(4096 + 48 * 256 * 16, dtype=torch.int32, device=_DEV)
+        # Seq slots plus trace/history headroom, matching production Runtime.
+        # Zero once; monotonically increasing tags separate subsequent launches.
+        self.syncws = torch.zeros(4096 + 48 * 256 * 16 + 24576, dtype=torch.int32, device=_DEV)
 
         # activation / scratch buffers
-        mk = lambda *s, dt=torch.bfloat16: torch.empty(*s, dtype=dt, device=_DEV)  # noqa: E731
+        mk = lambda *s, dt=torch.bfloat16: torch.zeros(*s, dtype=dt, device=_DEV)  # noqa: E731
         self.xEmb = mk(H)
         self.xn1P = mk(H * 16)
         self.attnP = mk(H * 16)
@@ -145,22 +177,29 @@ class _Runtime:
 
     # ---- weights: HIR logical layouts -> kernel fractal packs (once) ----
     def set_weights(self, w):
-        key = tuple(id(t) for t in w.values())
+        key = tuple((id(t), t._version) for t in w.values())
         if key == self._weight_key:
             return
         cpu = {k: t.detach().to("cpu") for k, t in w.items()}
-        # w_qkv (L, H, NQKV_PAD) -> per layer (NQKV_PAD, H), pad rows zero
+        # Translate HIR logical weights to the current chunk-major cube stream.
         wqkv = torch.cat([
-            _pack_w(cpu["w_qkv"][li].T[:NQKV], NQKV_PAD) for li in range(L)])
-        # w_o (L, Q, H_PAD) -> (NO_PAD, Q); w_down (L, I, H_PAD) -> (ND_PAD, I)
+            _pack_w_chunks(cpu["w_qkv"][li].T[:NQKV], NQKV, NQKV_PAD,
+                           176, 96, 2, H // 256) for li in range(L)])
         wo = torch.cat([
-            _pack_w(cpu["w_o"][li][:, :H].T, NO_PAD) for li in range(L)])
+            _pack_w_chunks(cpu["w_o"][li][:, :H].T, H, NO_PAD,
+                           96, 96, 1, H // 256) for li in range(L)])
+        gu = cpu["w_gu"].transpose(1, 2).contiguous()
+        if GU_INTERLEAVE:
+            gu = torch.stack([gu[:, :II].reshape(L, NB, 256, H),
+                              gu[:, II:].reshape(L, NB, 256, H)], dim=2).reshape(L, NGU, H)
         wg = torch.cat([
-            _pack_w(cpu["w_gu"][li].T, NGU) for li in range(L)])
+            _pack_w_chunks(gu[li], NGU, NGU, 512, 128, 4, H // 256)
+            for li in range(L)])
         wd = torch.cat([
-            _pack_w(cpu["w_down"][li][:, :H].T, ND_PAD) for li in range(L)])
-        # w_lm (V, H) -> (NB*SPAN, H) padded
-        wlm = _pack_w(cpu["w_lm"], NB * SPAN)
+            _pack_w_chunks(cpu["w_down"][li][:, :H].T, H, ND_PAD,
+                           96, 96, 1, II // 256) for li in range(L)])
+        wlm = _pack_w_chunks(cpu["w_lm"], VV, NB * SPAN,
+                            SPAN, NC_LM, NRD_LM, H // 256)
         dev = {
             "WqkvP": wqkv.to(_DEV), "WoP": wo.to(_DEV), "WguP": wg.to(_DEV),
             "WdP": wd.to(_DEV), "WlmP": wlm.to(_DEV),
@@ -180,31 +219,29 @@ class _Runtime:
             self.d_out, self.logits, self.idx_tab, self.part_max,
             self.part_idx, self.syncws, self.xnfP,
         ]
+        # Retain inputs so Python cannot recycle ids while the packed copy is cached.
+        self._weight_inputs = tuple(w.values())
         self._weight_key = key
 
     # ---- caches: logical (L, C, KVH, D) -> zero-padded fractal planes ----
     def stage_caches(self, k_caches, v_caches, pos: int):
-        nb = (pos + 15) // 16               # live 16-position blocks
-        kc = k_caches[:, :pos, :, :].detach().to("cpu").permute(0, 2, 1, 3) \
-            .reshape(L * KVH, pos, D)
-        vc = v_caches[:, :pos, :, :].detach().to("cpu").permute(0, 2, 1, 3) \
-            .reshape(L * KVH, pos, D)
-        kp = torch.zeros(L * KVH, nb * 16, D, dtype=torch.bfloat16)
+        # K uses contiguous 256-position tiles (R5+), not global d-major NZ.
+        nt = (pos + SLT - 1) // SLT
+        nb = (pos + 15) // 16
+        kc = k_caches[:, :pos].detach().to("cpu").permute(0, 2, 1, 3).reshape(L * KVH, pos, D)
+        vc = v_caches[:, :pos].detach().to("cpu").permute(0, 2, 1, 3).reshape(L * KVH, pos, D)
+        kp = torch.zeros(L * KVH, nt * SLT, D, dtype=torch.bfloat16)
         vp = torch.zeros(L * KVH, nb * 16, D, dtype=torch.bfloat16)
         kp[:, :pos] = kc
         vp[:, :pos] = vc
-        # K pack: [d_blk][s_blk][s_row][d_col] -- prefix scatters per d_blk
-        pk = (kp.view(L * KVH, nb, 16, 8, 16).permute(0, 3, 1, 2, 4)
-              .contiguous().view(L * KVH, 8, nb * 256))
-        # V pack: [s_blk][d_blk][d_col][s_row] -- prefix is one run
+        pk = (kp.view(L * KVH, nt, 16, 16, 8, 16).permute(0, 1, 4, 2, 3, 5)
+              .contiguous().view(L * KVH, nt * SLT * D))
         pv = (vp.view(L * KVH, nb, 16, 8, 16).permute(0, 1, 3, 4, 2)
-              .contiguous().view(L * KVH, nb * 8 * 256))
-        # every row past the live prefix must read exactly ZERO (the scan
-        # tiles' tail trick); full zero then prefix scatter
+              .contiguous().view(L * KVH, nb * 16 * D))
         self.KcP.zero_()
         self.VcP.zero_()
-        self.KcP.view(L * KVH, 8, SB * 256)[:, :, : nb * 256].copy_(pk.to(_DEV))
-        self.VcP.view(L * KVH, VREGION)[:, : nb * 8 * 256].copy_(pv.to(_DEV))
+        self.KcP.view(L * KVH, KREGION)[:, :nt * SLT * D].copy_(pk.to(_DEV))
+        self.VcP.view(L * KVH, VREGION)[:, :nb * 16 * D].copy_(pv.to(_DEV))
 
     def stage_rope(self, cos_cache, sin_cache, ctx: int):
         """The kernel's table form: doubled cos, first-half-negated sin."""
@@ -217,10 +254,16 @@ class _Runtime:
 
     # ---- one launch: token at position pos -> argmax token id ----
     def launch_step(self, pos: int) -> int:
+        if (self.launch_no + 1) * 512 + 511 > 0x7fffffff:
+            raise OverflowError("launch tag exhausted; recreate the quiescent runtime")
         self.partAccP.zero_()
+        self.logits.view(16, NB, SPANP)[0].fill_(-1e30)
         tag = (self.launch_no + 1) * 512       # stale seq words never match
         self.launch_no += 1
-        stream = torch.npu.current_stream().npu_stream
+        # Raw ctypes launch bypasses torch_npu's queued host tasks.
+        launch_stream = torch.npu.current_stream()
+        launch_stream.synchronize()
+        stream = launch_stream.npu_stream
         _lib.run_megak(
             ctypes.c_void_p(self.ffts),
             *[ctypes.c_void_p(t.data_ptr()) for t in self.ptrs],
@@ -240,7 +283,7 @@ class _Runtime:
 
     def read_rows(self, pos: int):
         ib, ir = pos // 16, pos % 16
-        krows = self.KcP.view(L * KVH, 8, SB, 16, 16)[:, :, ib, ir, :]
+        krows = self.KcP.view(L * KVH, SPADG // SLT, 8, 16, 16, 16)[:, pos // SLT, :, ib % 16, ir, :]
         vrows = self.VcP.view(L * KVH, SB, 8, 16, 16)[:, ib, :, :, ir]
         k_rows = krows.reshape(L, KVH, D).unsqueeze(1).cpu()
         v_rows = vrows.reshape(L, KVH, D).unsqueeze(1).cpu()
@@ -271,7 +314,7 @@ class Qwen3MegaRT:
         rt = _runtime()
         ctx = int(k_caches.shape[1])
         pos = int(pos_ids[0])
-        if not 0 <= pos < min(ctx, SPADG):
+        if not 0 <= pos < min(ctx, 40960):
             raise ValueError(
                 f"mega_step: pos {pos} outside the live cache extent "
                 f"(ctx_len={ctx}, kernel SPADG={SPADG})"

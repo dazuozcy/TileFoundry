@@ -1,0 +1,122 @@
+{
+  "upstream_source_sha256": "a6bc5c2b884b7a2b15feef96e36a82cb54e1b2c2a0d4d88aeba9c343934b3737",
+  "upstream": "kernel/mega.cpp (R30)",
+  "chunks": {
+    "kernel/model/model_config.hpp": {
+      "upstream_start_line": 66,
+      "upstream_lines": 7,
+      "source_sha256": "61195a59cd8e4ec559ae02cb1fcf97713ea800802bbf6cb7289fd200d0bc6004"
+    },
+    "kernel/backend/ascend910b/layout.hpp": {
+      "upstream_start_line": 73,
+      "upstream_lines": 49,
+      "source_sha256": "4611140fa3635a54bf53d6e48fb6f0814591d966a3091a2e2930305dbd781ce9"
+    },
+    "kernel/backend/ascend910b/protocol.hpp": {
+      "upstream_start_line": 122,
+      "upstream_lines": 71,
+      "source_sha256": "fb78e1bf3b65cb23f472b61d88967716394dd944082405d0b018e633edbf77c9"
+    },
+    "kernel/backend/ascend910b/cube.hpp": {
+      "upstream_start_line": 193,
+      "upstream_lines": 265,
+      "source_sha256": "aea28b57898905f0cfe6198c865bd37cf77052afc9d67e0920d15d23cd94e6de"
+    },
+    "kernel/backend/ascend910b/vector_core.hpp": {
+      "upstream_start_line": 458,
+      "upstream_lines": 41,
+      "source_sha256": "1aeb5be0a19ad1004fb594d73bd7e2e63b8baef4315500feeabf2baef9a0e23c"
+    },
+    "kernel/model/operators.hpp": {
+      "upstream_start_line": 499,
+      "upstream_lines": 35,
+      "source_sha256": "44444b4a484b6de13d7993e2d3fbba3ef3b3b71ea2aa668a6e99f704e4a06016"
+    },
+    "kernel/backend/ascend910b/vector_io.hpp": {
+      "upstream_start_line": 534,
+      "upstream_lines": 169,
+      "source_sha256": "c9df39a823bebd613ef2c6aff50b4b76bfb89ee2c67eb713ff4d52c5e151a823"
+    },
+    "kernel/model/stages/cube/qkv.inc": {
+      "upstream_start_line": 884,
+      "upstream_lines": 15,
+      "source_sha256": "58c1999d6604e8369c083c22ca76b8866eb65b16db9159bc81547a0ddeb7be25"
+    },
+    "kernel/model/stages/cube/attention_qk_pv.inc": {
+      "upstream_start_line": 899,
+      "upstream_lines": 149,
+      "source_sha256": "8bb09dff0c8d41678ac096ffde6d74b2fc25491f844e1ac047d4309718129e8b"
+    },
+    "kernel/model/stages/cube/output_projection.inc": {
+      "upstream_start_line": 1048,
+      "upstream_lines": 35,
+      "source_sha256": "b55308c5a6ff0b51cfacb9220c31c5ab2f2f53e5364a9a7879c7ef93aaa903a5"
+    },
+    "kernel/model/stages/cube/gate_up.inc": {
+      "upstream_start_line": 1083,
+      "upstream_lines": 14,
+      "source_sha256": "001c9709ad606605927ced6c49df4da98f2e5a7a5d4107fbcf58756f32e28e67"
+    },
+    "kernel/model/stages/cube/down.inc": {
+      "upstream_start_line": 1097,
+      "upstream_lines": 19,
+      "source_sha256": "bc708e18bb44d055e5e7afb8b201ca9df90b5f441af5e96b112d01df14ccf652"
+    },
+    "kernel/model/stages/cube/lm_head.inc": {
+      "upstream_start_line": 1119,
+      "upstream_lines": 20,
+      "source_sha256": "71f0f9ef7b4e94f128dcd47397898d2cabf2fd447d3ba9145262c6a2a24b557c"
+    },
+    "kernel/model/stages/vector/input_norm.inc": {
+      "upstream_start_line": 1304,
+      "upstream_lines": 13,
+      "source_sha256": "58f3edee119046f5d56ddab10051099789ececc480c883730e2e821a2186eef0"
+    },
+    "kernel/model/stages/vector/qk_norm_rope_kv.inc": {
+      "upstream_start_line": 1317,
+      "upstream_lines": 80,
+      "source_sha256": "b17409d73c340905d2b07a77e7743378bb8f1f8334dd4314c8d598e694bb284e"
+    },
+    "kernel/model/stages/vector/softmax_combine.inc": {
+      "upstream_start_line": 1397,
+      "upstream_lines": 309,
+      "source_sha256": "1f3f0fe04888d94502544e6a74319cc6c3d8a182d8bb6bca39cb022ddc22b3da"
+    },
+    "kernel/model/stages/vector/residual_mlp_norm.inc": {
+      "upstream_start_line": 1706,
+      "upstream_lines": 36,
+      "source_sha256": "29bf75c657aebb83158559dd5a6fc33a58f0d93f5d8fe3d6a26e6568db131021"
+    },
+    "kernel/model/stages/vector/activation.inc": {
+      "upstream_start_line": 1742,
+      "upstream_lines": 30,
+      "source_sha256": "03a988196a0f5c1b452aa03d39b5ea42df05aadefc45ef93d420a5ad92e679dc"
+    },
+    "kernel/model/stages/vector/residual.inc": {
+      "upstream_start_line": 1772,
+      "upstream_lines": 10,
+      "source_sha256": "9c24da665c76789a388e82d38f6d0c400c9f4705b34423df3499bfd47a0ee95d"
+    },
+    "kernel/model/stages/vector/final_norm_argmax.inc": {
+      "upstream_start_line": 1784,
+      "upstream_lines": 49,
+      "source_sha256": "4e82580a692f3b0a505daa1d6cf273687c2dd4ada7adf09c1cf9028a52375d8d"
+    },
+    "kernel/backend/ascend910b/cube_resources.inc": {
+      "upstream_start_line": 720,
+      "upstream_lines": 131,
+      "source_sha256": "5656d322332aacbec0a1896f10895ef4322b19d93d93bb99b020e76994dc32bf"
+    },
+    "kernel/backend/ascend910b/vector_resources.inc": {
+      "upstream_start_line": 1140,
+      "upstream_lines": 161,
+      "source_sha256": "b27d20d00d03786edd290714f57c52b4e9c6399aab5ce4341a2b022fcba0161c"
+    },
+    "kernel/launch.inc": {
+      "upstream_start_line": 1836,
+      "upstream_lines": 30,
+      "source_sha256": "de31e177553c05773c58aa51879b6dde1a9395448a09b6c30112eb5f2d1996e7"
+    }
+  },
+  "upstream_executable_token_sha256": "23b0a478e98f8e814ca1b60aef1126c9bdec1fb1fa679b31a503af50102b9475"
+}

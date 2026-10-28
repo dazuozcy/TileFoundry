@@ -1,0 +1,34 @@
+/home/tilelang/zuochuanuong/TileFoundry-fork/examples/qwen3_1_7b-mega-ascendc/fupan/ascendc-910b-adapter/assets/megakernel-template/test_mega.py:91: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+  torch.full_like(ii + kc + jj, KB * FB))
+libmegak.so loaded, ffts=0xfee00000000
+== gate sl=40959 lstop=28 ==
+  xn1P           PASS  maxdiff=0.09766
+  qkv_out        PASS  maxdiff=0.09445
+  q2P row0       PASS  maxdiff=0.0625
+  q2P row1       PASS  maxdiff=0.07031
+  K append       PASS  maxdiff=0.07812
+  V append       PASS  maxdiff=0.06801
+  scores r0      PASS  maxdiff=0.005832
+  scores r1      PASS  maxdiff=0.004658
+  part_m(shift)  PASS  maxdiff=0.01202
+  part_l         PASS  maxdiff=0.21
+  partAcc r0     PASS  maxdiff=0.02839
+  partAcc r1     PASS  maxdiff=0.02542
+  attnP          PASS  maxdiff=1.907e-05
+  o_out          PASS  maxdiff=7.495e-06
+  xn2P           PASS  maxdiff=0.1094
+  gu_out         PASS  maxdiff=0.1004
+  hP             PASS  maxdiff=0.1875
+  d_out          PASS  maxdiff=0.09434
+  xnfP           PASS  maxdiff=0.1172
+  logits         PASS  maxdiff=0.05695
+  argmax kernel=121520 ref=121520 PASS
+  repeat 1/8: PASS
+  repeat 2/8: PASS
+  repeat 3/8: PASS
+  repeat 4/8: PASS
+  repeat 5/8: PASS
+  repeat 6/8: PASS
+  repeat 7/8: PASS
+  repeat 8/8: PASS
+GATE PASS
